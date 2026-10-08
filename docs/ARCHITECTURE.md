@@ -18,6 +18,8 @@ React/Tauri Window
  │         ├── guarda contra atributos Windows offline/reparse/recall
  │         ├── BLAKE3 de conteúdo (até 8 GiB lidos; metadados revalidados)
  │         └── identidade do arquivo (same-file) para descartar hardlinks
+ ├── search_path({root,regex,minSizeBytes,maxFiles}) — enumeração de metadados,
+ │    sem abrir conteúdo nem recalcular BLAKE3; ranking limitado a 500 itens
  ├── disk_health({drive}) — Windows Storage read-only
  └── optimize_volume({drive,execute})
       ├── gate Rust por unidade (análise aprovada, TTL 5 min, uso único)
@@ -46,7 +48,8 @@ O frontend recebe relatórios serializados (camelCase) e apresenta **apenas info
 
 - `src/App.tsx`: navegação, estados, busca, tabelas, ações explícitas, comunicação Tauri.
 - `src/styles.css`: tokens visuais dark/glass, backdrop-filter, breakpoints, foco visível e reduced motion.
-- `src-tauri/src/scan.rs`: algoritmo de varredura/agrupamento e testes.
+- `src-tauri/src/scan.rs`: algoritmo de varredura/agrupamento e testes; contador de bytes retornados por leituras exitosas, inclusive de hashes interrompidos por erros.
+- `src-tauri/src/search.rs`: pesquisa por metadados independente de hashing, com ranking limitado e limite de 4.096 bytes de Regex.
 - `src-tauri/src/optimize.rs`: adaptador nativo Windows e validação da letra da unidade.
 - `src-tauri/src/health.rs`: diagnóstico de capacidade e confiabilidade por comandos Windows de leitura, com sensores opcionais.
 - `src-tauri/src/lib.rs`: fronteira IPC; tarefas que leem disco ficam fora do thread principal.
@@ -97,3 +100,10 @@ Sem benchmark antes/depois, não afirmar superioridade numérica.
 2. Verificar com Files On-Demand do OneDrive que pastas e placeholders aparecem no inventário sem download durante hash.
 3. Testar troca/modificação de arquivo enquanto ocorre BLAKE3; relatório deve indicar resultado parcial.
 4. Executar testes Rust, frontend e integração em volume descartável. CI atual está bloqueado e não fornece evidência de aprovação.
+
+## Revisão do orçamento de hashing e busca (08/10/2026)
+
+- A leitura de cada candidato para BLAKE3 permanece sequencial e limitada ao tamanho do metadado inicial. Mesmo se uma leitura posterior falhar, bytes já recebidos contam no orçamento de 8 GiB. O relatório não confunde esse contador de payload retornado com I/O físico medido por SMART ou pelo controlador.
+- O scanner e a pesquisa têm limite de tamanho de Regex no backend (4.096 bytes), compilação com tamanho máximo de programa Regex e contagem explícita de correspondências.
+- O scanner mantém apenas 500 correspondências de busca em memória; o inventário de arquivos da varredura completa continua em memória e será substituído por indexação persistente em fase posterior.
+- O build local e CI Windows devem passar antes de afirmar homologação; a conta GitHub Actions pode impedir a inicialização dos jobs por condição de faturamento.

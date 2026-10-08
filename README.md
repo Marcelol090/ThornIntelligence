@@ -23,7 +23,7 @@ npm install
 npm run tauri dev
 ```
 
-O núcleo inicial está em `main`; recursos de segurança e saúde adicionais estão sendo revisados em PRs separados.
+A análise de volumes está separada da pesquisa por metadados. O backend exige autorização por unidade para ações de otimização; não há limpeza ou desfragmentação automática.
 
 `npm run dev` sozinho mostra a interface no navegador, **mas não executa o scanner Rust**. Use `npm run tauri dev` para análise de arquivos e integração com o Windows.
 
@@ -31,7 +31,7 @@ O núcleo inicial está em `main`; recursos de segurança e saúde adicionais es
 
 1. Seleção da pasta via diálogo nativo (sem salvar o conteúdo na nuvem).
 2. Varredura de tamanho lógico, total de arquivos, maiores diretórios, ranking de arquivos e distribuição por extensão.
-3. Filtro por expressão regular no caminho/nome e tamanho mínimo em MB.
+3. Filtro por expressão regular no caminho/nome e tamanho mínimo em MB; padrões Regex limitados a 4.096 bytes na busca e no scanner completo.
 4. Identificação de duplicados **exatos**: primeiro agrupa por tamanho e depois confirma com hash completo BLAKE3, dentro do limite de leitura. Verifica identidade física com `same-file`, descarta aliases de hardlinks e ignora arquivos vazios nas economias estimadas.
 5. Visão de grupos duplicados, hash e caminhos para revisão manual — **sem botão de exclusão**.
 6. Análise de fragmentação do volume no Windows e otimização explícita via PowerShell, com política do próprio Windows para HDD/SSD/tiered.
@@ -43,9 +43,9 @@ O núcleo inicial está em `main`; recursos de segurança e saúde adicionais es
 ### Limites operacionais iniciais
 
 - Até **250.000 arquivos** por varredura da interface (núcleo aceita até 1 milhão); o resultado marca explicitamente truncamento.
-- Orçamento de até **8 GiB de conteúdo lido** para hash de candidatos duplicados, priorizando grupos de arquivos maiores. Fora desse orçamento, o relatório avisa que pode haver mais cópias.
+- Orçamento de até **8 GiB de bytes retornados por leituras de conteúdo** para hashing de candidatos duplicados, incluindo tentativas que falhem após leituras parciais. Isso não equivale ao número exato de bytes físicos lidos pelo dispositivo (cache e read-ahead do SO). Fora desse orçamento, o relatório avisa que pode haver mais cópias.
 - Exibe até 300 maiores arquivos, 300 diretórios, 300 grupos duplicados e 500 correspondências de busca.
-- Leitura direta local, sem indexação persistente nesta versão; cada nova busca executa nova varredura.
+- Leitura direta local, sem indexação persistente nesta versão; pesquisas executam uma nova **enumeração de metadados**, sem refazer hashes BLAKE3, e preservam o relatório de duplicados.
 - Não segue symlinks. Erros de acesso são contabilizados.
 - Até 1.024 referências por grupo de hash para a identificação de hardlinks. Grupos maiores ou identidades inacessíveis são omitidos da estimativa e sinalizados como análise parcial.
 - O módulo de hardlinks usa identificadores de arquivo fornecidos pelo SO; sistemas de arquivos específicos podem ter limitações, portanto nenhuma limpeza destrutiva é autorizada automaticamente.
@@ -55,7 +55,7 @@ O núcleo inicial está em `main`; recursos de segurança e saúde adicionais es
 - O módulo de otimização é Windows-only. Não força `-Defrag` em SSD, não eleva privilégios e não agenda tarefas automaticamente. O backend exige análise bem-sucedida da mesma unidade nos últimos 5 minutos, com autorização de uso único; análises simultâneas e operações concorrentes na mesma unidade são bloqueadas.
 - Em Windows, arquivos marcados como offline, recall-on-access ou reparse são listados por metadados, mas não têm conteúdo lido para hash; o relatório contabiliza candidatos ignorados. Essa política conservadora pode deixar duplicados não identificados.
 - O hash confere tamanho e data de modificação antes/depois da leitura, reduzindo resultados inconsistentes; não elimina condições de corrida do filesystem.
-- Funcionalidade de pré-visualização do impacto, métricas SMART, snapshot SQLite incremental, content-grep e tratamentos de hardlinks estão planejados.
+- Funcionalidades ainda planejadas: pré-visualização do impacto, snapshots SQLite incrementais, content-grep, progresso/cancelamento e métricas de espaço físico real. A análise de hardlinks já existe e permanece conservadora.
 
 ## Comandos de qualidade
 

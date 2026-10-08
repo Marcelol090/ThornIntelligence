@@ -1,10 +1,10 @@
 use blake3::Hasher;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use same_file::Handle;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
@@ -134,56 +134,80 @@ fn avoid_content_read(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-fn content_hash(path: &Path, expected_size: u64) -> std::io::Result<Option<String>> {
-    // Check metadata *before* opening content to avoid most cloud hydration.
-    // A concurrent filesystem change remains possible (TOCTOU); no destructive
-    // operation is authorized by these results.
-    let before = std::fs::symlink_metadata(path)?;
-    if before.file_type().is_symlink()
-        || avoid_content_read(&before)
-        || before.len() != expected_size
-    {
-        return Ok(None);
-    }
-    let modified = before.modified()?;
-    let file = File::open(path)?;
-    let opened = file.metadata()?;
-    if opened.len() != expected_size || opened.modified()? != modified {
-        return Ok(None);
-    }
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
-    let mut hasher = Hasher::new();
-    let mut buffer = [0u8; 65536];
-    let mut count = 0_u64;
-    loop {
-        let bytes = reader.read(&mut buffer)?;
-        if bytes == 0 { break; }
-        count += bytes as u64;
-        hasher.update(&buffer[..bytes]);
-    }
-    let after = reader.get_ref().metadata()?;
-    if count != expected_size || after.len() != expected_size || after.modified()? != modified {
-        return Ok(None);
-    }
-    let path_after = std::fs::symlink_metadata(path)?;
-    if path_after.file_type().is_symlink()
-        || avoid_content_read(&path_after)
-        || path_after.len() != expected_size
-        || path_after.modified()? != modified
-    {
-        return Ok(None);
-    }
-    Ok(Some(hasher.finalize().to_hex().to_string()))
+/// Returns both the digest outcome and the count of content bytes actually
+/// returned by successful read() calls. Error/changed-file paths retain their
+/// I/O cost so repeated failures cannot silently bypass the scan budget.
+///
+/// OS caches and filesystem read-ahead may cause physical device I/O to differ;
+/// this counter deliberately measures successful application-level read bytes.
+fn content_hash(path: &Path, expected_size: u64) -> (std::io::Result<Option<String>>, u64) {
+    let mut bytes_read = 0u64;
+    let result = (|| -> std::io::Result<Option<String>> {
+        let before = std::fs::symlink_metadata(path)?;
+        if before.file_type().is_symlink()
+            || avoid_content_read(&before)
+            || before.len() != expected_size
+        {
+            return Ok(None);
+        }
+        let modified = before.modified()?;
+        let mut file = File::open(path)?;
+        let opened = file.metadata()?;
+        if opened.len() != expected_size
+            || opened.modified()? != modified
+            || avoid_content_read(&opened)
+        {
+            return Ok(None);
+        }
+
+        let mut hasher = Hasher::new();
+        let mut buffer = [0u8; 65536];
+        while bytes_read < expected_size {
+            // Never read beyond the originally measured size. A file growing
+            // concurrently must not consume an unbounded I/O budget.
+            let remaining = expected_size - bytes_read;
+            let limit = (remaining.min(buffer.len() as u64)) as usize;
+            let count = file.read(&mut buffer[..limit])?;
+            if count == 0 {
+                return Ok(None);
+            }
+            bytes_read += count as u64;
+            hasher.update(&buffer[..count]);
+        }
+
+        let after = file.metadata()?;
+        if after.len() != expected_size
+            || after.modified()? != modified
+            || avoid_content_read(&after)
+        {
+            return Ok(None);
+        }
+        let path_after = std::fs::symlink_metadata(path)?;
+        if path_after.file_type().is_symlink()
+            || avoid_content_read(&path_after)
+            || path_after.len() != expected_size
+            || path_after.modified()? != modified
+        {
+            return Ok(None);
+        }
+        Ok(Some(hasher.finalize().to_hex().to_string()))
+    })();
+    (result, bytes_read)
 }
 
 fn prepare_regex(pattern: Option<&str>) -> Result<Option<Regex>, String> {
     match pattern.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(pattern) => RegexBuilder::new(pattern)
-            .case_insensitive(true)
-            .size_limit(4 * 1024 * 1024)
-            .build()
-            .map(Some)
-            .map_err(|err| format!("Expressão regular inválida: {err}")),
+        Some(pattern) => {
+            if pattern.len() > 4096 {
+                return Err("Regex excede o limite de 4096 bytes.".into());
+            }
+            RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .size_limit(4 * 1024 * 1024)
+                .build()
+                .map(Some)
+                .map_err(|err| format!("Expressão regular inválida: {err}"))
+        },
         None => Ok(None),
     }
 }
@@ -201,7 +225,8 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
     let mut records = Vec::<FileRecord>::new();
     let mut directories = HashMap::<PathBuf, DirectorySize>::new();
     let mut types = HashMap::<String, (u64, u64)>::new();
-    let mut matches = Vec::<FileResult>::new();
+    // A bounded ranking avoids cloning/sorting up to a million matching paths.
+    let mut matches = BTreeMap::<(u64, String), FileResult>::new();
     let mut total_matches = 0_usize;
     let mut errors = 0_usize;
     let mut error_samples = Vec::new();
@@ -265,7 +290,8 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
         if size >= min_size
             && pattern.as_ref().is_none_or(|regex| regex.is_match(&result.path)) {
             total_matches += 1;
-            matches.push(result.clone());
+            matches.insert((size, result.path.clone()), result.clone());
+            if matches.len() > MAX_MATCHES { matches.pop_first(); }
         }
         let hash_eligible = !avoid_content_read(&metadata);
         records.push(FileRecord { path, size, result, hash_eligible });
@@ -274,8 +300,7 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
     let mut top_files: Vec<FileResult> = records.iter().map(|file| file.result.clone()).collect();
     top_files.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     top_files.truncate(MAX_RESULTS);
-    matches.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-    matches.truncate(MAX_MATCHES);
+    let matches: Vec<FileResult> = matches.into_iter().rev().map(|(_, file)| file).collect();
 
     let mut top_directories: Vec<DirectoryResult> = directories
         .into_iter()
@@ -323,9 +348,11 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
                 duplicate_analysis_complete = false;
                 continue;
             }
-            match content_hash(&record.path, record.size) {
+            let (hash_result, consumed_bytes) = content_hash(&record.path, record.size);
+            // Charge the budget even if hashing fails after a partial read.
+            hashed_bytes = hashed_bytes.saturating_add(consumed_bytes);
+            match hash_result {
                 Ok(Some(hash)) => {
-                    hashed_bytes = hashed_bytes.saturating_add(size);
                     groups.entry((size, hash)).or_default().push(record.result.path.clone());
                 }
                 Ok(None) => {
@@ -525,7 +552,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("size.dat");
         fs::write(&file, b"sample").unwrap();
-        assert!(content_hash(&file, 100).unwrap().is_none());
+        assert!(content_hash(&file, 100).0.unwrap().is_none());
     }
 
     #[cfg(windows)]
@@ -540,6 +567,24 @@ mod tests {
     #[test]
     fn rejects_invalid_regular_expression() {
         assert!(prepare_regex(Some("[")).is_err());
+        assert!(prepare_regex(Some(&"x".repeat(4097))).is_err());
+        assert!(prepare_regex(Some(&"x".repeat(4096))).is_ok());
+    }
+
+    #[test]
+    fn counts_all_successful_read_bytes_for_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.dat");
+        let payload = vec![37u8; 128 * 1024 + 13];
+        fs::write(&path, &payload).unwrap();
+
+        let (result, consumed) = content_hash(&path, payload.len() as u64);
+        assert!(result.unwrap().is_some());
+        assert_eq!(consumed, payload.len() as u64);
+
+        let (mismatch, consumed) = content_hash(&path, payload.len() as u64 + 1);
+        assert!(mismatch.unwrap().is_none());
+        assert_eq!(consumed, 0);
     }
 
     #[test]
