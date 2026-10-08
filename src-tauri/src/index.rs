@@ -518,7 +518,16 @@ pub fn browse_tree(db_path: &Path, request: TreeRequest) -> Result<TreePage, Str
         }
     }
     let limit = request.limit.unwrap_or(TREE_PAGE_DEFAULT).clamp(1,TREE_PAGE_MAX);
-    let mut conn = connection(db_path)?;
+    if !db_path.is_file() {
+        return Err("Nenhum índice SQLite encontrado. Use Atualizar índice.".into());
+    }
+    // Direct-child navigation must not execute schema migrations or CREATE
+    // INDEX checks on each click. A published index can be read in SQLite WAL
+    // mode with a read-only connection.
+    let mut conn = Connection::open_with_flags(
+        db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+    ).map_err(db_err)?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(db_err)?;
     // SQLite WAL snapshot: the generation, folder children and file children
     // must all refer to the same committed index version.
     let tx = conn.transaction().map_err(db_err)?;
@@ -624,6 +633,16 @@ mod tests {
             root:root.display().to_string(),parent_path:parent.display().to_string(),
             after,limit:Some(limit),generation,
         }
+    }
+
+    #[test]
+    fn tree_browsing_without_index_is_read_only_and_does_not_create_db() {
+        let tmp=tempfile::tempdir().unwrap();
+        let root=tmp.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        let db=tmp.path().join("not-created.sqlite");
+        assert!(browse_tree(&db,tree_req(&root,&root,100,None,None)).is_err());
+        assert!(!db.exists());
     }
 
     #[test]
