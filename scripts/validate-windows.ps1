@@ -16,7 +16,7 @@ function Invoke-Checked {
         throw ("Validation failed: {0} exited with code {1}" -f $Command, $LASTEXITCODE)
     }
 }
-foreach ($binary in @('node', 'npm', 'cargo', 'rustc')) {
+foreach ($binary in @('node', 'npm.cmd', 'cargo', 'rustc')) {
     if (-not (Get-Command $binary -ErrorAction SilentlyContinue)) {
         throw "Missing prerequisite: $binary"
     }
@@ -24,9 +24,9 @@ foreach ($binary in @('node', 'npm', 'cargo', 'rustc')) {
 Push-Location $root
 try {
     if (-not $SkipInstall) {
-        Invoke-Checked 'npm' @('install', '--no-audit', '--no-fund')
+        Invoke-Checked 'npm.cmd' @('install', '--no-audit', '--no-fund')
     }
-    Invoke-Checked 'npm' @('run', 'build')
+    Invoke-Checked 'npm.cmd' @('run', 'build')
     Invoke-Checked 'cargo' @('fmt', '--manifest-path', 'src-tauri/Cargo.toml', '--all', '--', '--check')
     Invoke-Checked 'cargo' @('test', '--manifest-path', 'src-tauri/Cargo.toml')
     Invoke-Checked 'cargo' @('check', '--manifest-path', 'src-tauri/Cargo.toml')
