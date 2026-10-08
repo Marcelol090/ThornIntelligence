@@ -227,3 +227,9 @@ A auditoria rejeita redirecionamento do diretório raiz, valida UUIDs do manifes
 **Referências verificadas com Exa:** [SQLite atomic commit](https://www.sqlite.org/atomiccommit.html), [SQLite database recovery behavior](https://www.sqlite.org/howtocorrupt.html), [Microsoft SetFileInformationByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle). A atomicidade SQLite **não** torna atômica uma operação que também movimenta arquivos no Windows.
 
 **Testes adicionados, ainda não homologados no Windows:** entradas `prepared`, ausentes, divergentes e órfãs; limite de auditoria sem falsos órfãos; diretório vazio sem criação de banco. A função atual de movimento por caminhos `MoveFileExW` continua sujeita a riscos residuais TOCTOU em ambientes hostis, logo esta feature não equivale a aprovação para uso da quarentena em produção.
+
+## Feedback correto do escopo durante a varredura
+
+A faixa **Escopo atual** agora mostra imediatamente a pasta efetivamente selecionada enquanto o scanner está trabalhando, com estado `ANALISANDO`, mesmo antes de existir um `ScanReport`. O estado `activeScanRoot` é separado de `report.root`: cancelar ou falhar a operação restaura automaticamente a indicação do último relatório concluído, sem apagar os dados anteriores. Não é exibida uma porcentagem inventada durante enumerações sem total conhecido.
+
+A motivação foi a captura da interface com `51.971 arquivos processados` mas `Nenhuma pasta selecionada`. Pesquisa prévia Exa sobre feedback de scanners: [rdirstat](https://github.com/AndyGybels/rdirstat), [ZDirMap](https://github.com/TheHolyOneZ/ZDirMap) e [WizTree changelog](https://diskanalyzer.com/download). Testar no Windows: iniciar escopo novo, cancelar com e sem relatório anterior e terminar com sucesso.

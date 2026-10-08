@@ -102,6 +102,7 @@ export default function App() {
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [cancelRequested, setCancelRequested] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [activeScanRoot, setActiveScanRoot] = useState<string | null>(null);
   const [includeDuplicates, setIncludeDuplicates] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
@@ -206,6 +207,8 @@ export default function App() {
     activeJob.current = jobId;
     setScanProgress(null);
     setCancelRequested(false);
+    // Display the running folder independently of the last completed report.
+    setActiveScanRoot(path);
     setBusy(true);
     try {
       const parsed = Number(min);
@@ -224,6 +227,7 @@ export default function App() {
       if (activeJob.current === jobId) activeJob.current = null;
       setScanProgress(null);
       setCancelRequested(false);
+      setActiveScanRoot(null);
       setBusy(false);
     }
   }
@@ -556,7 +560,7 @@ export default function App() {
   }
 
   const scanned = report !== null;
-  const roots = report?.root ?? '';
+  const roots = activeScanRoot ?? report?.root ?? '';
   const scopeName = roots ? (roots.split(/[\\/]/).filter(Boolean).pop() ?? roots) : 'Nenhuma pasta selecionada';
 
   return <div className="app-shell">
@@ -609,7 +613,7 @@ export default function App() {
           </div>
         </div>
 
-        <div className="scope-strip glass"><div className="scope-icon"><Folder size={19}/></div><div className="scope-details"><small>ESCOPO ATUAL</small><strong title={roots}>{scopeName}</strong></div><span className="scope-full" title={roots}>{scanned ? truncatePath(roots, 56) : 'Escolha uma pasta ou unidade para iniciar'}</span><Tag tone={scanned ? 'green' : 'neutral'}>{scanned ? 'ANALISADO' : 'AGUARDANDO'}</Tag></div>
+        <div className="scope-strip glass"><div className="scope-icon"><Folder size={19}/></div><div className="scope-details"><small>{activeScanRoot ? 'ESCOPO EM ANÁLISE' : 'ESCOPO ATUAL'}</small><strong title={roots}>{scopeName}</strong></div><span className="scope-full" title={roots}>{roots ? truncatePath(roots, 56) : 'Escolha uma pasta ou unidade para iniciar'}</span><Tag tone={activeScanRoot ? 'blue' : scanned ? 'green' : 'neutral'}>{activeScanRoot ? 'ANALISANDO' : scanned ? 'ANALISADO' : 'AGUARDANDO'}</Tag></div>
 
         {(busy || searchBusy || allocationBusy || compareBusy || indexBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
           <div className="activity-spinner"><LoaderCircle size={20} className="spin"/></div>
