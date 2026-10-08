@@ -1,11 +1,12 @@
-import { useRef, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
 import { Channel, invoke } from '@tauri-apps/api/core';
+import { Effect, getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
   Activity, AlertCircle, ArrowRight, ArrowUpRight,
   BarChart3, Check, CheckCircle2, ChevronRight, CircleHelp, Clipboard,
   Database, Disc3, File, FileSearch, Fingerprint, Folder, FolderOpen,
-  Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu,
+  Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu, CloudOff,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
 import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
@@ -52,7 +53,10 @@ function FileRows({ files, copy }: { files: FileResult[]; copy: (path: string) =
     <div className="file-table-head"><span>ARQUIVO</span><span>TIPO</span><span>TAMANHO</span><span></span></div>
     {files.map((file) => <div className="file-row" key={file.path}>
       <span className="file-identity"><span className="file-icon"><File size={18}/></span><span className="file-text"><strong title={file.name}>{file.name}</strong><small title={file.path}>{truncatePath(file.path, 64)}</small></span></span>
-      <span className="type-cell">{file.extension}</span><strong className="size-cell">{bytes(file.sizeBytes)}</strong>
+      <span className="type-cell">{file.extension}
+        {file.contentStatus === 'offline' && <small className="storage-status remote" title="Metadados indicam armazenamento remoto/offline; o aplicativo não abriu o conteúdo">Remoto/offline</small>}
+        {file.contentStatus === 'reparse' && <small className="storage-status reparse" title="Arquivo virtual ou redirecionado (reparse point); conteúdo não foi aberto">Redirecionado</small>}
+      </span><strong className="size-cell">{bytes(file.sizeBytes)}</strong>
       <button className="icon-button" type="button" title="Copiar caminho" aria-label={'Copiar caminho de ' + file.name} onClick={() => copy(file.path)}><Clipboard size={16}/></button>
     </div>)}
   </div>;
@@ -90,7 +94,29 @@ export default function App() {
   const [optimizing, setOptimizing] = useState(false);
   const [diskHealth, setDiskHealth] = useState<DiskHealth | null>(null);
   const [healthBusy, setHealthBusy] = useState(false);
+  const [cloudFilter, setCloudFilter] = useState<'all' | 'offline' | 'reparse'>('all');
   const [mobileMenu, setMobileMenu] = useState(false);
+
+  // Native DWM Mica (Windows 11), with Acrylic fallback (Windows 10).
+  // Tauri must create a transparent window; the page needs transparent layers.
+  // If unsupported or refused by the OS, keep the existing opaque dark theme.
+  useEffect(() => {
+    if (!navigator.userAgent.includes('Windows')) return;
+    let mounted = true;
+    const apply = async () => {
+      try {
+        await getCurrentWindow().setEffects({ effects: [Effect.Mica, Effect.Acrylic] });
+        if (mounted) document.documentElement.classList.add('native-vibrancy');
+      } catch {
+        if (mounted) document.documentElement.classList.remove('native-vibrancy');
+      }
+    };
+    void apply();
+    return () => {
+      mounted = false;
+      document.documentElement.classList.remove('native-vibrancy');
+    };
+  }, []);
 
   async function copy(value: string) {
     try { await navigator.clipboard.writeText(value); setToast('Caminho copiado.'); }
@@ -279,9 +305,16 @@ export default function App() {
           <div className="activity-details">
             <strong>{scanProgress?.phase === 'hashing' ? 'Verificando duplicados com BLAKE3' :
               scanProgress?.phase === 'verifying' ? 'Conferindo identidades físicas' :
-              scanProgress?.phase === 'searching' ? 'Pesquisando metadados' : 'Analisando diretórios'}</strong>
-            <small>{number(scanProgress?.filesScanned ?? 0)} arquivos processados
-              {scanProgress && scanProgress.hashBytesRead > 0 ? ' · ' + bytes(scanProgress.hashBytesRead) + ' lidos por hash' : ''}
+              scanProgress?.phase === 'searching' ? 'Pesquisando metadados' :
+              scanProgress?.phase === 'fingerprinting' ? 'Comparando amostras de 16 KiB' :
+              'Analisando diretórios'}</strong>
+            <small>{number(scanProgress?.filesScanned ?? 0)} {
+              scanProgress?.phase === 'hashing' ? 'candidatos com BLAKE3 completo' :
+              scanProgress?.phase === 'fingerprinting' ? 'candidatos amostrados' :
+              'arquivos enumerados'
+            }{scanProgress && scanProgress.hashBytesRead > 0
+              ? ' · ' + bytes(scanProgress.hashBytesRead) + ' lidos no total (amostras + BLAKE3)'
+              : ''}
             </small>
           </div>
           <button type="button" className="outline-button" disabled={cancelRequested || !scanProgress}
@@ -323,7 +356,29 @@ export default function App() {
           <section className="panel glass wide-panel"><SectionHeading kicker="OPORTUNIDADES" title="Arquivos que mais ocupam espaço" right={<button className="text-button" onClick={() => selectSection('explorer')}>Explorar arquivos <ArrowRight size={16}/></button>}/><FileRows files={report.topFiles.slice(0, 7)} copy={copy}/></section>
         </>}
 
-        {section === 'explorer' && report && <section className="panel glass full-panel"><SectionHeading kicker="RANKING POR TAMANHO" title="Arquivos grandes" description="Os 300 maiores arquivos encontrados na varredura; exibidos por tamanho lógico." right={<Tag tone="blue">{report.topFiles.length} resultados</Tag>}/><FileRows files={report.topFiles} copy={copy}/></section>}
+        {section === 'explorer' && report && <section className="panel glass full-panel">
+          <SectionHeading kicker="RANKING POR TAMANHO" title="Arquivos grandes"
+            description="Os 300 maiores arquivos encontrados, com identificação de conteúdo offline e redirecionamentos feita apenas pelos metadados."
+            right={<Tag tone="blue">{report.topFiles.length} resultados</Tag>}/>
+          <div className="storage-filters" role="group" aria-label="Filtrar por disponibilidade de arquivo">
+            {([
+              ['all', 'Todos'],
+              ['offline', 'Remoto / offline'],
+              ['reparse', 'Redirecionados'],
+            ] as const).map(([status, label]) =>
+              <button key={status} type="button" aria-pressed={cloudFilter === status}
+                className={'storage-filter ' + (cloudFilter === status ? 'active' : '')}
+                onClick={() => setCloudFilter(status)}>{status !== 'all' && <CloudOff size={14}/>}
+                {label}</button>
+            )}
+          </div>
+          <p className="panel-note">O filtro atua sobre os 300 maiores arquivos do relatório.
+            O status remoto é inferido por atributos do Windows; não exige download do arquivo.
+            Outros arquivos virtuais podem não apresentar todos esses atributos.</p>
+          <FileRows files={report.topFiles.filter(file =>
+            cloudFilter === 'all' || file.contentStatus === cloudFilter
+          )} copy={copy}/>
+        </section>}
 
         {section === 'duplicates' && report && <div className="stack-gap">
           <div className="insight-banner glass"><div className="insight-icon"><Fingerprint size={25}/></div><div><small>DUPLICAÇÃO VERIFICADA</small><strong>{bytes(report.potentialSavingsBytes)} de economia potencial</strong><p>Apenas cópias independentes, com mesmo tamanho e hash BLAKE3 idêntico, aparecem abaixo. Hardlinks foram excluídos das economias estimadas. Nenhum arquivo é removido.</p></div><Tag tone={report.duplicateAnalysisComplete ? 'green' : 'amber'}>{report.duplicateAnalysisComplete ? 'HASH COMPLETO*' : 'HASH PARCIAL'}</Tag></div>

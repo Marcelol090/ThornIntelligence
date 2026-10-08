@@ -91,3 +91,33 @@ npm run tauri dev
 **Bloqueio conhecido:** o GitHub Actions vinha falhando antes de iniciar os jobs. O código desta melhoria precisa passar por esses comandos em Windows antes de uma homologação. O app não executa exclusão automática ou desfragmentação autônoma.
 
 Fontes: [Tauri 2 Channels](https://docs.rs/tauri/latest/tauri/ipc/struct.Channel.html), [Tauri Calling Frontend](https://v2.tauri.app/develop/calling-frontend/), [AssetHoard: lições de IPC em 120.000 arquivos](https://assethoard.com/blog/when-120000-files-meet-tauri).
+
+## Performance: BLAKE3 em duas etapas e exploração cloud-aware (rodada 08/10/2026)
+
+- O scanner faz enumeração e agrupa arquivos por **tamanho**. Para cada grupo de mesmo tamanho, lê no máximo **16 KiB** por candidato para gerar uma assinatura BLAKE3 *parcial*.
+- Apenas subgrupos cujo prefixo coincide chegam ao BLAKE3 do **conteúdo completo**. Uma amostra igual não é prova de duplicação e nunca autoriza limpeza. O agrupamento final segue tamanho + hash completo + identidade física, com hardlinks excluídos da estimativa.
+- A cota de 8 GiB contabiliza bytes retornados **tanto na amostragem quanto no hashing completo**, inclusive leituras parciais mal sucedidas. Leitura física real depende do cache e do controlador, não equivale a esse contador.
+- Os três estágios `scanning`, `fingerprinting` e `hashing` têm contadores separados na interface: arquivos enumerados, candidatos amostrados e candidatos com BLAKE3 completo. O progresso não inventa percentual/ETA.
+- O ranking de maiores arquivos limita clones ao top 300 em vez de copiar/ordenar os 250 mil registros.
+- Explorador: filtros para **todos**, **metadados remotos/offline** e **redirecionamentos (reparse)** nos top 300. Os marcadores são derivados de atributos de arquivos do Windows, sem abrir conteúdo ou fazer downloads. Diretórios reparse/junction são ignorados para evitar travessia de raízes externas; análise fica explicitamente parcial nesses casos.
+- Esses filtros só mostram os 300 maiores itens do relatório, não uma varredura cloud completa. Um atributo ausente não comprova que o arquivo é inteiramente local.
+
+## Glassmorphism nativo no Windows
+
+- A janela Tauri tem `transparent: true`, e o frontend usa `getCurrentWindow().setEffects()` para solicitar **Mica no Windows 11** e **Acrylic como fallback no Windows 10**.
+- Após a confirmação da API, apenas as superfícies visuais necessárias se tornam translúcidas; no caso de API indisponível, permanece o tema escuro opaco. O comportamento visual também depende de **Configurações do Windows → Personalização → Cores → Efeitos de transparência** e da versão/build do Windows.
+- Atenção: esse blur do DWM atua no fundo da janela; `backdrop-filter` é o desfoque local da camada HTML. Não são a mesma tecnologia e nenhum dos dois deve ser forçado em hardware que não oferecer suporte.
+
+### Validação obrigatória
+
+```powershell
+npm install
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml
+npm run tauri dev
+```
+
+Testar: Windows 10 (Acrylic) e Windows 11 (Mica), efeitos de transparência ativados/desativados, redimensionamento e contraste; HDD e NVMe com centenas de milhares de arquivos de diferentes tamanhos; OneDrive Files On-Demand; amostras iguais com finais diferentes; hardlinks; cancelamento e orçamento de leitura. Executar benchmarks **antes/depois** em pasta de teste descartável; não anunciar ganhos numéricos sem medição.
+
+Fontes Exa: [Tauri setEffects](https://v2.tauri.app/reference/javascript/api/namespacewindow/), [Tauri window-vibrancy](https://github.com/tauri-apps/window-vibrancy), [Microsoft File Attribute Constants](https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants), [DiskSleuth staged hashing](https://github.com/Swatto86/DiskSleuth).

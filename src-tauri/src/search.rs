@@ -1,4 +1,4 @@
-use crate::scan::{FileResult, ScanProgress};
+use crate::scan::{content_status, FileResult, ScanProgress};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -27,6 +27,7 @@ pub struct SearchReport {
     pub truncated: bool,
 }
 
+#[cfg(test)]
 pub fn search(request: SearchRequest) -> Result<SearchReport, String> {
     search_with_control(request, &AtomicBool::new(false), |_| {})
 }
@@ -55,16 +56,23 @@ pub fn search_with_control(
     let mut top = BTreeMap::<(u64, String), FileResult>::new();
     let (mut files_scanned, mut total_matches, mut errors) = (0, 0, 0);
     let mut truncated = false;
-    for entry in WalkDir::new(&root).follow_links(false) {
+    let mut walker = WalkDir::new(&root).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
         if cancel.load(Ordering::Relaxed) {
             return Err("Operação cancelada pelo usuário.".into());
         }
         let entry = match entry { Ok(e) => e, Err(_) => { errors += 1; continue; } };
-        if !entry.file_type().is_file() { continue; }
-        if files_scanned >= max_files { truncated = true; break; }
-        let metadata = match entry.metadata() {
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
             Ok(m) => m, Err(_) => { errors += 1; continue; }
         };
+        if entry.file_type().is_symlink() { continue; }
+        if entry.file_type().is_dir() {
+            // Avoid recursing into Windows junctions / cloud reparse trees.
+            if content_status(&metadata) != "local" { walker.skip_current_dir(); }
+            continue;
+        }
+        if !entry.file_type().is_file() { continue; }
+        if files_scanned >= max_files { truncated = true; break; }
         files_scanned += 1;
         if last_update.elapsed() >= Duration::from_millis(250) {
             progress(ScanProgress {
@@ -85,6 +93,7 @@ pub fn search_with_control(
         top.insert((size, path.clone()), FileResult {
             name: entry.file_name().to_string_lossy().into_owned(),
             path, size_bytes: size, extension,
+            content_status: content_status(&metadata).to_owned(),
         });
         if top.len() > 500 { top.pop_first(); }
     }

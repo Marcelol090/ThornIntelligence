@@ -28,6 +28,8 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
 }
 
 const MAX_HASH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+// Cheap content sampling never certifies a duplicate; only a full BLAKE3 does.
+const PREFIX_BYTES: usize = 16 * 1024;
 const MAX_RESULTS: usize = 300;
 const MAX_MATCHES: usize = 500;
 // Avoid exhausting OS handles when inspecting huge identical-content groups.
@@ -49,6 +51,8 @@ pub struct FileResult {
     pub path: String,
     pub size_bytes: u64,
     pub extension: String,
+    /// Metadata only. Does not open or download a cloud placeholder.
+    pub content_status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +126,19 @@ fn name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Attribute-only classification. Reparse points are not necessarily OneDrive;
+/// never assume their content is locally readable.
+#[cfg(windows)]
+pub(crate) fn content_status(meta: &std::fs::Metadata) -> &'static str {
+    use std::os::windows::fs::MetadataExt;
+    let flags = meta.file_attributes();
+    if flags & (0x1000 | 0x40000 | 0x400000) != 0 { "offline" }
+    else if flags & 0x400 != 0 { "reparse" }
+    else { "local" }
+}
+#[cfg(not(windows))]
+pub(crate) fn content_status(_: &std::fs::Metadata) -> &'static str { "local" }
+
 fn extension(path: &Path) -> String {
     path.extension()
         .map(|value| value.to_string_lossy().to_ascii_lowercase())
@@ -158,6 +175,7 @@ fn avoid_content_read(_metadata: &std::fs::Metadata) -> bool {
 ///
 /// OS caches and filesystem read-ahead may cause physical device I/O to differ;
 /// this counter deliberately measures successful application-level read bytes.
+#[cfg(test)]
 fn content_hash(path: &Path, expected_size: u64) -> (std::io::Result<Option<String>>, u64) {
     content_hash_with_cancel(path, expected_size, &AtomicBool::new(false))
 }
@@ -227,6 +245,59 @@ fn content_hash_with_cancel(
     (result, bytes_read)
 }
 
+/// A bounded prefix fingerprint for the first PREFIX_BYTES only.
+/// Errors and partial reads are accounted just like a full BLAKE3 pass.
+/// The prefix is exclusively a rejection filter, never duplicate evidence.
+fn fingerprint_prefix(
+    path: &Path, expected_size: u64, cancel: &AtomicBool,
+) -> (std::io::Result<Option<String>>, u64) {
+    let mut bytes_read = 0u64;
+    let result = (|| -> std::io::Result<Option<String>> {
+        let before = std::fs::symlink_metadata(path)?;
+        if before.file_type().is_symlink()
+            || avoid_content_read(&before)
+            || before.len() != expected_size {
+            return Ok(None);
+        }
+        let modified = before.modified()?;
+        let mut file = File::open(path)?;
+        let opened = file.metadata()?;
+        if avoid_content_read(&opened)
+            || opened.len() != expected_size
+            || opened.modified()? != modified {
+            return Ok(None);
+        }
+        let mut hasher = Hasher::new();
+        let to_read = expected_size.min(PREFIX_BYTES as u64);
+        let mut buffer = [0u8; 8192];
+        while bytes_read < to_read {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted, "Operação cancelada pelo usuário.",
+                ));
+            }
+            let remaining = (to_read - bytes_read).min(buffer.len() as u64) as usize;
+            let amount = file.read(&mut buffer[..remaining])?;
+            if amount == 0 { return Ok(None); }
+            hasher.update(&buffer[..amount]);
+            bytes_read += amount as u64;
+        }
+        let after = file.metadata()?;
+        let path_after = std::fs::symlink_metadata(path)?;
+        if avoid_content_read(&after)
+            || avoid_content_read(&path_after)
+            || path_after.file_type().is_symlink()
+            || after.len() != expected_size
+            || path_after.len() != expected_size
+            || after.modified()? != modified
+            || path_after.modified()? != modified {
+            return Ok(None);
+        }
+        Ok(Some(hasher.finalize().to_hex().to_string()))
+    })();
+    (result, bytes_read)
+}
+
 fn prepare_regex(pattern: Option<&str>) -> Result<Option<Regex>, String> {
     match pattern.map(str::trim).filter(|value| !value.is_empty()) {
         Some(pattern) => {
@@ -244,6 +315,7 @@ fn prepare_regex(pattern: Option<&str>) -> Result<Option<Regex>, String> {
     }
 }
 
+#[cfg(test)]
 pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
     scan_with_control(request, &AtomicBool::new(false), |_| {})
 }
@@ -256,7 +328,13 @@ pub fn scan_with_control(
     let timer = Instant::now();
     let mut last_update = Instant::now();
     progress(ScanProgress { phase: "scanning".into(), files_scanned: 0, hash_bytes_read: 0 });
-    let root = std::fs::canonicalize(Path::new(&request.root))
+    let requested_root = Path::new(&request.root);
+    let root_metadata = std::fs::symlink_metadata(requested_root)
+        .map_err(|err| format!("Pasta não encontrada ou inacessível: {err}"))?;
+    if root_metadata.file_type().is_symlink() || content_status(&root_metadata) != "local" {
+        return Err("Selecione uma pasta local, não uma raiz virtual ou junction.".into());
+    }
+    let root = std::fs::canonicalize(requested_root)
         .map_err(|err| format!("Pasta não encontrada ou inacessível: {err}"))?;
     if !root.is_dir() {
         return Err("Selecione um diretório, não um arquivo.".into());
@@ -273,11 +351,13 @@ pub fn scan_with_control(
     let mut errors = 0_usize;
     let mut error_samples = Vec::new();
     let mut directories_scanned = 0_usize;
+    let mut skipped_reparse_directories = 0_usize;
     let mut logical_bytes = 0_u64;
     let mut truncated = false;
 
     directories.insert(root.clone(), DirectorySize::default());
-    for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+    let mut walker = WalkDir::new(&root).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
         check_cancel(cancel)?;
         let entry = match entry {
             Ok(value) => value,
@@ -289,6 +369,14 @@ pub fn scan_with_control(
         };
         if entry.file_type().is_symlink() { continue; }
         if entry.file_type().is_dir() {
+            // Do not recurse into junctions, reparse dirs or cloud virtual folders.
+            if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
+                if content_status(&meta) != "local" {
+                    walker.skip_current_dir();
+                    skipped_reparse_directories += 1;
+                    continue;
+                }
+            }
             directories_scanned += 1;
             directories.entry(entry.path().to_path_buf()).or_default();
             continue;
@@ -298,7 +386,7 @@ pub fn scan_with_control(
             truncated = true;
             break;
         }
-        let metadata = match entry.metadata() {
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
             Ok(value) => value,
             Err(err) => {
                 errors += 1;
@@ -314,6 +402,7 @@ pub fn scan_with_control(
             path: path.display().to_string(),
             size_bytes: size,
             extension: file_type.clone(),
+            content_status: content_status(&metadata).to_owned(),
         };
         logical_bytes = logical_bytes.saturating_add(size);
         let category = types.entry(file_type).or_default();
@@ -348,9 +437,16 @@ pub fn scan_with_control(
         }
     }
 
-    let mut top_files: Vec<FileResult> = records.iter().map(|file| file.result.clone()).collect();
-    top_files.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-    top_files.truncate(MAX_RESULTS);
+    // Keep just the top 300 file copies, not a 250k-element cloned list.
+    let mut top_ranking = BTreeMap::<(u64, String), FileResult>::new();
+    for file in &records {
+        top_ranking.insert(
+            (file.size, file.result.path.clone()), file.result.clone()
+        );
+        if top_ranking.len() > MAX_RESULTS { top_ranking.pop_first(); }
+    }
+    let top_files: Vec<FileResult> = top_ranking.into_iter().rev()
+        .map(|(_, value)| value).collect();
     let matches: Vec<FileResult> = matches.into_iter().rev().map(|(_, file)| file).collect();
 
     let mut top_directories: Vec<DirectoryResult> = directories
@@ -385,48 +481,109 @@ pub fn scan_with_control(
     candidate_buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
     let mut hashed_bytes = 0_u64;
-    let mut skipped_content_files = 0_usize;
-    let mut duplicate_analysis_complete = true;
+    // Directory reparse exclusions make the duplicate inventory deliberately partial.
+    let mut skipped_content_files = skipped_reparse_directories;
+    let mut duplicate_analysis_complete = skipped_reparse_directories == 0;
     let mut groups = HashMap::<(u64, String), Vec<String>>::new();
+
+    // Stage 1: sample only 16 KiB per candidate, grouped by size.
+    // This avoids full reads for files that share a size but not a prefix.
+    let mut prefix_candidates = Vec::<(u64, Vec<&FileRecord>)>::new();
+    let mut sampled = 0usize;
     progress(ScanProgress {
-        phase: "hashing".into(),
-        files_scanned: records.len(),
-        hash_bytes_read: hashed_bytes,
+        phase: "fingerprinting".into(), files_scanned: 0, hash_bytes_read: 0,
     });
     for (size, bucket) in candidate_buckets {
+        let mut prefixes = HashMap::<String, Vec<&FileRecord>>::new();
         for record in bucket {
             check_cancel(cancel)?;
+            sampled += 1;
             if !record.hash_eligible {
                 skipped_content_files += 1;
                 duplicate_analysis_complete = false;
                 continue;
             }
-            if hashed_bytes.saturating_add(size) > MAX_HASH_BYTES {
+            let planned = size.min(PREFIX_BYTES as u64);
+            if hashed_bytes.saturating_add(planned) > MAX_HASH_BYTES {
+                duplicate_analysis_complete = false;
+                continue;
+            }
+            let (digest, consumed) = fingerprint_prefix(&record.path, record.size, cancel);
+            hashed_bytes = hashed_bytes.saturating_add(consumed);
+            check_cancel(cancel)?;
+            match digest {
+                Ok(Some(prefix)) => prefixes.entry(prefix).or_default().push(record),
+                Ok(None) => {
+                    errors += 1;
+                    duplicate_analysis_complete = false;
+                    if error_samples.len() < 12 {
+                        error_samples.push(format!(
+                            "Arquivo alterado ou indisponível durante amostragem: {}",
+                            record.path.display()
+                        ));
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    errors += 1;
+                    duplicate_analysis_complete = false;
+                    if error_samples.len() < 12 {
+                        error_samples.push(format!("{}: {err}", record.path.display()));
+                    }
+                    continue;
+                }
+            }
+            if last_update.elapsed() >= Duration::from_millis(250) {
+                progress(ScanProgress {
+                    phase: "fingerprinting".into(), files_scanned: sampled,
+                    hash_bytes_read: hashed_bytes,
+                });
+                last_update = Instant::now();
+            }
+        }
+        for (_, items) in prefixes {
+            if items.len() > 1 { prefix_candidates.push((size, items)); }
+        }
+    }
+
+    // Stage 2: expensive *complete* BLAKE3 only for prefix-matching sets.
+    // A matching prefix is NOT considered a duplicate on its own.
+    prefix_candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let mut fully_hashed = 0usize;
+    progress(ScanProgress {
+        phase: "hashing".into(), files_scanned: 0, hash_bytes_read: hashed_bytes,
+    });
+    for (_size, bucket) in prefix_candidates {
+        for record in bucket {
+            check_cancel(cancel)?;
+            if hashed_bytes.saturating_add(record.size) > MAX_HASH_BYTES {
                 duplicate_analysis_complete = false;
                 continue;
             }
             let (hash_result, consumed_bytes) =
                 content_hash_with_cancel(&record.path, record.size, cancel);
-            check_cancel(cancel)?;
-            // Charge the budget even if hashing fails after a partial read.
             hashed_bytes = hashed_bytes.saturating_add(consumed_bytes);
+            fully_hashed += 1;
+            check_cancel(cancel)?;
             if last_update.elapsed() >= Duration::from_millis(250) {
                 progress(ScanProgress {
-                    phase: "hashing".into(),
-                    files_scanned: records.len(),
+                    phase: "hashing".into(), files_scanned: fully_hashed,
                     hash_bytes_read: hashed_bytes,
                 });
                 last_update = Instant::now();
             }
             match hash_result {
                 Ok(Some(hash)) => {
-                    groups.entry((size, hash)).or_default().push(record.result.path.clone());
+                    groups.entry((record.size, hash)).or_default().push(record.result.path.clone());
                 }
                 Ok(None) => {
                     errors += 1;
                     duplicate_analysis_complete = false;
                     if error_samples.len() < 12 {
-                        error_samples.push(format!("Arquivo alterado ou indisponível durante hash: {}", record.path.display()));
+                        error_samples.push(format!(
+                            "Arquivo alterado ou indisponível durante hash: {}",
+                            record.path.display()
+                        ));
                     }
                 }
                 Err(err) => {
@@ -592,6 +749,42 @@ mod tests {
     }
 
     #[test]
+    fn partial_prefix_rejects_same_size_different_content_without_full_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        // Prefixes differ at byte zero; no full-file hashing is needed.
+        fs::write(dir.path().join("one"), vec![0x11; 64 * 1024]).unwrap();
+        fs::write(dir.path().join("two"), vec![0x22; 64 * 1024]).unwrap();
+        let mut phases = Vec::new();
+        let report = scan_with_control(ScanRequest {
+            root: dir.path().display().to_string(), regex: None,
+            min_size_bytes: None, max_files: None,
+        }, &AtomicBool::new(false), |p| phases.push(p.phase)).unwrap();
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.hash_bytes_read, 2 * PREFIX_BYTES as u64);
+        assert!(report.duplicate_analysis_complete);
+        assert!(phases.iter().any(|p| p == "fingerprinting"));
+    }
+
+    #[test]
+    fn equal_prefix_different_tail_requires_full_content_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = vec![0x11; PREFIX_BYTES + 100];
+        let mut second = first.clone();
+        first[PREFIX_BYTES] = 1;
+        second[PREFIX_BYTES] = 2;
+        fs::write(dir.path().join("one"), first).unwrap();
+        fs::write(dir.path().join("two"), second).unwrap();
+        let report = scan(ScanRequest {
+            root: dir.path().display().to_string(), regex: None,
+            min_size_bytes: None, max_files: None,
+        }).unwrap();
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.hash_bytes_read, 2 * PREFIX_BYTES as u64
+            + 2 * (PREFIX_BYTES as u64 + 100));
+        assert!(report.duplicate_analysis_complete);
+    }
+
+    #[test]
     fn scans_sizes_and_verifies_exact_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
@@ -709,6 +902,22 @@ mod tests {
         let (mismatch, consumed) = content_hash(&path, payload.len() as u64 + 1);
         assert!(mismatch.unwrap().is_none());
         assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn limits_big_file_results_without_losing_largest_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..330 {
+            let path = dir.path().join(format!("f{i:03}.dat"));
+            fs::write(path, vec![i as u8; i + 1]).unwrap();
+        }
+        let report = scan(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: None,
+        }).unwrap();
+        assert_eq!(report.top_files.len(), MAX_RESULTS);
+        assert_eq!(report.top_files[0].size_bytes, 330);
+        assert_eq!(report.top_files.last().unwrap().size_bytes, 31);
     }
 
     #[test]

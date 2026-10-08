@@ -3,6 +3,7 @@ export interface FileResult {
   path: string;
   sizeBytes: number;
   extension: string;
+  contentStatus: 'local' | 'offline' | 'reparse';
 }
 
 export interface DirectoryResult {
