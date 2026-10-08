@@ -32,6 +32,7 @@ A análise de volumes está separada da pesquisa por metadados. O backend exige 
 1. Seleção da pasta via diálogo nativo (sem salvar o conteúdo na nuvem).
 2. Varredura de tamanho lógico, total de arquivos, maiores diretórios, ranking de arquivos e distribuição por extensão.
 3. Filtro por expressão regular no caminho/nome e tamanho mínimo em MB; padrões Regex limitados a 4.096 bytes na busca e no scanner completo.
+3a. **Progresso em tempo real e cancelamento cooperativo:** enumeração, hashing e conferência de identidade mostram contagem de arquivos e bytes lidos; cancelamento por operação não devolve resultados parciais e preserva o último relatório.
 4. Identificação de duplicados **exatos**: primeiro agrupa por tamanho e depois confirma com hash completo BLAKE3, dentro do limite de leitura. Verifica identidade física com `same-file`, descarta aliases de hardlinks e ignora arquivos vazios nas economias estimadas.
 5. Visão de grupos duplicados, hash e caminhos para revisão manual — **sem botão de exclusão**.
 6. Análise de fragmentação do volume no Windows e otimização explícita via PowerShell, com política do próprio Windows para HDD/SSD/tiered.
@@ -50,12 +51,12 @@ A análise de volumes está separada da pesquisa por metadados. O backend exige 
 - Até 1.024 referências por grupo de hash para a identificação de hardlinks. Grupos maiores ou identidades inacessíveis são omitidos da estimativa e sinalizados como análise parcial.
 - O módulo de hardlinks usa identificadores de arquivo fornecidos pelo SO; sistemas de arquivos específicos podem ter limitações, portanto nenhuma limpeza destrutiva é autorizada automaticamente.
 - O scanner não implementa ainda uma abertura de arquivos livre de condições de corrida (TOCTOU), nem garante que metadados Windows cubram todos os provedores de nuvem. Para segurança máxima, evite escanear pastas sincronizadas sensíveis até validar em Windows.
-- O scanner é assíncrono do ponto de vista da UI, mas ainda não implementa cancelamento, progresso incremental ou snapshot SQLite.
+- O scanner é assíncrono do ponto de vista da UI, com progresso por Tauri Channel e cancelamento cooperativo por sessão. Ainda não implementa snapshot SQLite, retomada de varredura ou indexação incremental.
 - A leitura de saúde é Windows-only, e indicadores SMART podem estar ausentes (por modelo, driver, barramento ou privilégios). Um resultado `Healthy` não é garantia de ausência de falhas.
 - O módulo de otimização é Windows-only. Não força `-Defrag` em SSD, não eleva privilégios e não agenda tarefas automaticamente. O backend exige análise bem-sucedida da mesma unidade nos últimos 5 minutos, com autorização de uso único; análises simultâneas e operações concorrentes na mesma unidade são bloqueadas.
 - Em Windows, arquivos marcados como offline, recall-on-access ou reparse são listados por metadados, mas não têm conteúdo lido para hash; o relatório contabiliza candidatos ignorados. Essa política conservadora pode deixar duplicados não identificados.
 - O hash confere tamanho e data de modificação antes/depois da leitura, reduzindo resultados inconsistentes; não elimina condições de corrida do filesystem.
-- Funcionalidades ainda planejadas: pré-visualização do impacto, snapshots SQLite incrementais, content-grep, progresso/cancelamento e métricas de espaço físico real. A análise de hardlinks já existe e permanece conservadora.
+- Funcionalidades ainda planejadas: pré-visualização do impacto, snapshots SQLite incrementais, content-grep e métricas de espaço físico real. A análise de hardlinks já existe e permanece conservadora.
 
 ## Comandos de qualidade
 
@@ -68,3 +69,25 @@ cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
 Os testes Rust incluem confirmação de hash para duplicados, Regex inválida, limite de varredura e validação da letra da unidade. CI executa build frontend e testes nativos no Windows; formatação Rust deve ser verificada localmente antes de merge.
 
 Leia [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) para módulos, prioridades, política de disco e roadmap.
+
+## Progresso e cancelamento (branch de melhoria)
+
+- A UI cria um `jobId` por varredura ou pesquisa; o backend aceita no máximo uma dessas operações simultaneamente.
+- Um `Channel<ScanProgress>` envia apenas **fase**, arquivos processados e bytes retornados por leituras de hash, com emissão limitada a ~4 eventos por segundo (mais mudanças de fase).
+- `cancel_scan(jobId)` marca apenas a operação correspondente. A enumeração verifica o cancelamento a cada entrada; o BLAKE3 a cada bloco (64 KiB); hardlinks a cada comparação. A operação cancela de forma cooperativa, sem matar threads abruptamente.
+- Cancelamentos rejeitam o relatório parcial, preservam os dados anteriormente apresentados, não apagam arquivos e não afetam a otimização de volumes.
+- Não há percentual global verdadeiro antes de conhecer a quantidade de arquivos, portanto a UI não inventa ETA ou progresso percentual.
+
+### Validação obrigatória
+
+```powershell
+npm install
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml
+npm run tauri dev
+```
+
+**Bloqueio conhecido:** o GitHub Actions vinha falhando antes de iniciar os jobs. O código desta melhoria precisa passar por esses comandos em Windows antes de uma homologação. O app não executa exclusão automática ou desfragmentação autônoma.
+
+Fontes: [Tauri 2 Channels](https://docs.rs/tauri/latest/tauri/ipc/struct.Channel.html), [Tauri Calling Frontend](https://v2.tauri.app/develop/calling-frontend/), [AssetHoard: lições de IPC em 120.000 arquivos](https://assethoard.com/blog/when-120000-files-meet-tauri).

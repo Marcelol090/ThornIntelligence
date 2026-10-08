@@ -95,3 +95,10 @@ export interface OptimizationResult {
 }
 
 export type Section = 'overview' | 'explorer' | 'duplicates' | 'search' | 'optimize';
+
+/** Lightweight IPC progress; no per-file paths or file contents are sent. */
+export interface ScanProgress {
+  phase: 'scanning' | 'hashing' | 'verifying' | 'searching' | 'complete';
+  filesScanned: number;
+  hashBytesRead: number;
+}

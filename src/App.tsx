@@ -1,5 +1,5 @@
-import { useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { useRef, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
   Activity, AlertCircle, ArrowRight, ArrowUpRight,
@@ -8,7 +8,7 @@ import {
   Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanRequest, SearchRequest, SearchReport, Section } from './types';
+import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -76,6 +76,9 @@ export default function App() {
   const [report, setReport] = useState<ScanReport | null>(null);
   const [searchResult, setSearchResult] = useState<SearchReport | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
+  const activeJob = useRef<string | null>(null);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [cancelRequested, setCancelRequested] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
@@ -95,6 +98,10 @@ export default function App() {
   }
 
   async function scanFolder(root?: string, pattern = regex, min = minMb) {
+    if (activeJob.current || busy || searchBusy) {
+      setError('Já existe uma análise em andamento.');
+      return;
+    }
     setError('');
     let path = root;
     if (!path) {
@@ -107,22 +114,50 @@ export default function App() {
         return;
       }
     }
+    const jobId = crypto.randomUUID();
+    const onProgress = new Channel<ScanProgress>();
+    onProgress.onmessage = (event) => {
+      if (activeJob.current === jobId) setScanProgress(event);
+    };
+    activeJob.current = jobId;
+    setScanProgress(null);
+    setCancelRequested(false);
     setBusy(true);
     try {
       const parsed = Number(min);
       if (!Number.isFinite(parsed) || parsed < 0) throw new Error('Tamanho mínimo inválido.');
       const request: ScanRequest = { root: path, regex: pattern.trim() || null, minSizeBytes: Math.floor(parsed * 1024 * 1024), maxFiles: 250_000 };
-      const result = await invoke<ScanReport>('scan_path', { request });
+      const result = await invoke<ScanReport>('scan_path', { request, jobId, onProgress });
       setReport(result);
       setSearchResult(null);
       setToast('Análise concluída em ' + duration(result.elapsedMs) + '.');
-    } catch (err) { setError(String(err)); }
-    finally { setBusy(false); }
+    } catch (err) {
+      const message = String(err);
+      if (message.includes('cancelada')) setToast('Varredura cancelada; o relatório anterior foi preservado.');
+      else setError(message);
+    } finally {
+      if (activeJob.current === jobId) activeJob.current = null;
+      setScanProgress(null);
+      setCancelRequested(false);
+      setBusy(false);
+    }
   }
 
   async function searchMetadata() {
     if (!report) return;
+    if (activeJob.current || busy || searchBusy) {
+      setError('Já existe uma operação em andamento.');
+      return;
+    }
     setError('');
+    const jobId = crypto.randomUUID();
+    const onProgress = new Channel<ScanProgress>();
+    onProgress.onmessage = (event) => {
+      if (activeJob.current === jobId) setScanProgress(event);
+    };
+    activeJob.current = jobId;
+    setScanProgress(null);
+    setCancelRequested(false);
     setSearchBusy(true);
     try {
       const parsed = Number(minMb);
@@ -135,13 +170,31 @@ export default function App() {
         minSizeBytes: Math.floor(parsed * 1048576),
         maxFiles: 250_000,
       };
-      const result = await invoke<SearchReport>('search_path', { request });
+      const result = await invoke<SearchReport>('search_path', { request, jobId, onProgress });
       setSearchResult(result);
       setToast('Busca por metadados concluída em ' + duration(result.elapsedMs) + '.');
     } catch (err) {
-      setError(String(err));
+      const message = String(err);
+      if (message.includes('cancelada')) setToast('Pesquisa cancelada; os resultados anteriores foram preservados.');
+      else setError(message);
     } finally {
+      if (activeJob.current === jobId) activeJob.current = null;
+      setScanProgress(null);
+      setCancelRequested(false);
       setSearchBusy(false);
+    }
+  }
+
+  async function cancelCurrentScan() {
+    const jobId = activeJob.current;
+    if (!jobId) return;
+    setCancelRequested(true);
+    try {
+      const accepted = await invoke<boolean>('cancel_scan', { jobId });
+      if (!accepted) setToast('Operação já finalizada.');
+    } catch (err) {
+      setError('Não foi possível cancelar a operação: ' + String(err));
+      setCancelRequested(false);
     }
   }
 
@@ -216,11 +269,27 @@ export default function App() {
       <main id="main-content" className="content">
         <div className="hero-heading">
           <div><div className="hero-kicker"><Sparkles size={14}/> ARMAZENAMENTO SOB CONTROLE</div><h1>{links.find((link) => link.id === section)?.label}<span className="heading-period">.</span></h1><p>Descubra o que ocupa espaço, identifique desperdícios e tome decisões com segurança.</p></div>
-          <button className="primary-button" disabled={busy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
+          <button className="primary-button" disabled={busy || searchBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
         </div>
 
         <div className="scope-strip glass"><div className="scope-icon"><Folder size={19}/></div><div className="scope-details"><small>ESCOPO ATUAL</small><strong title={roots}>{scopeName}</strong></div><span className="scope-full" title={roots}>{scanned ? truncatePath(roots, 56) : 'Escolha uma pasta ou unidade para iniciar'}</span><Tag tone={scanned ? 'green' : 'neutral'}>{scanned ? 'ANALISADO' : 'AGUARDANDO'}</Tag></div>
 
+        {(busy || searchBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
+          <div className="activity-spinner"><LoaderCircle size={20} className="spin"/></div>
+          <div className="activity-details">
+            <strong>{scanProgress?.phase === 'hashing' ? 'Verificando duplicados com BLAKE3' :
+              scanProgress?.phase === 'verifying' ? 'Conferindo identidades físicas' :
+              scanProgress?.phase === 'searching' ? 'Pesquisando metadados' : 'Analisando diretórios'}</strong>
+            <small>{number(scanProgress?.filesScanned ?? 0)} arquivos processados
+              {scanProgress && scanProgress.hashBytesRead > 0 ? ' · ' + bytes(scanProgress.hashBytesRead) + ' lidos por hash' : ''}
+            </small>
+          </div>
+          <button type="button" className="outline-button" disabled={cancelRequested || !scanProgress}
+            title={!scanProgress ? 'Aguardando inicialização no backend' : 'Interromper a operação atual'}
+            onClick={() => void cancelCurrentScan()}>
+            {cancelRequested ? 'Cancelando…' : 'Cancelar'}
+          </button>
+        </div>}
         {error && <div role="alert" className="alert error-alert"><AlertCircle size={19}/><span>{error}</span><button aria-label="Fechar aviso" className="icon-button" onClick={() => setError('')}><X size={16}/></button></div>}
         {toast && <div role="status" className="alert toast-alert"><Check size={17}/><span>{toast}</span><button aria-label="Fechar mensagem" className="icon-button" onClick={() => setToast('')}><X size={16}/></button></div>}
         {report && (report.truncated || report.errors > 0 || !report.duplicateAnalysisComplete || report.hardlinkAliases > 0 || report.skippedContentFiles > 0) && <div className="alert warning-alert"><Info size={18}/><span>{report.truncated ? 'Limite de 250.000 arquivos atingido; o relatório é parcial. ' : ''}{report.errors > 0 ? number(report.errors) + ' entradas não puderam ser processadas. ' : ''}{!report.duplicateAnalysisComplete ? 'Análise de duplicados incompleta (limite de leitura, arquivos indisponíveis ou modificados); pode haver mais cópias. ' : ''}{report.hardlinkAliases > 0 ? number(report.hardlinkAliases) + ' links físicos compartilhados foram excluídos das estimativas. ' : ''}{report.skippedContentFiles > 0 ? number(report.skippedContentFiles) + ' arquivos de conteúdo remoto/offline ou reparse foram ignorados no hash para evitar downloads involuntários. ' : ''}As estimativas não equivalem a espaço liberado.</span></div>}
@@ -269,7 +338,7 @@ export default function App() {
             <form className="search-form" onSubmit={(event: FormEvent) => { event.preventDefault(); void searchMetadata(); }}>
               <label className="field"><span>Expressão regular (nome ou caminho)</span><div className="input-wrap"><Search size={19}/><input type="text" placeholder="Ex.: \\.(iso|zip|mp4)$" value={regex} onChange={(e) => setRegex(e.target.value)} spellCheck={false}/></div></label>
               <label className="field min-field"><span>Tamanho mínimo (MB)</span><div className="input-wrap"><SlidersHorizontal size={18}/><input type="number" min="0" step="1" value={minMb} onChange={(e) => setMinMb(e.target.value)}/></div></label>
-              <button className="primary-button" type="submit" disabled={searchBusy}>{searchBusy ? <LoaderCircle className="spin" size={17}/> : <Search size={17}/>} {searchBusy ? 'Buscando…' : 'Buscar'}</button>
+              <button className="primary-button" type="submit" disabled={searchBusy || busy}>{searchBusy ? <LoaderCircle className="spin" size={17}/> : <Search size={17}/>} {searchBusy ? 'Buscando…' : 'Buscar'}</button>
             </form>
             <p className="panel-note"><LockKeyhole size={14}/> Busca somente por metadados: não abre conteúdo, não recalcula hashes e preserva o relatório de duplicados. Regex usa a sintaxe do Rust regex.</p>
           </section>

@@ -230,3 +230,12 @@ small{font-size:12px}
 .health-empty svg{color:#76c1f1;flex-shrink:0}
 @media(max-width:1050px){.health-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:570px){.health-grid{grid-template-columns:1fr 1fr}.health-grid>div{padding:10px}.health-grid strong{font-size:12px}}
+
+/* Per-session scan/search progress; never a fake percentage without a denominator. */
+.scan-activity{display:flex;align-items:center;gap:15px;border-radius:14px;padding:14px 17px;margin:0 0 17px}
+.activity-spinner{color:#8bc7ff;display:grid;place-items:center}
+.activity-details{display:grid;gap:6px;flex:1;min-width:0}
+.activity-details strong{font-size:12px;font-weight:700}
+.activity-details small{font-size:11px;color:#8fa4bd}
+.scan-activity .outline-button{min-height:36px}
+@media(max-width:570px){.scan-activity{flex-wrap:wrap}.scan-activity .outline-button{width:100%}}
