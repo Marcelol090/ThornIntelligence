@@ -163,13 +163,13 @@ fn unsafe_content_attributes(attributes: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn avoid_content_read(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn avoid_content_read(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     unsafe_content_attributes(metadata.file_attributes())
 }
 
 #[cfg(not(windows))]
-fn avoid_content_read(_metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn avoid_content_read(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
@@ -184,7 +184,7 @@ fn content_hash(path: &Path, expected_size: u64) -> (std::io::Result<Option<Stri
     content_hash_with_cancel(path, expected_size, &AtomicBool::new(false))
 }
 
-fn content_hash_with_cancel(
+pub(crate) fn content_hash_with_cancel(
     path: &Path,
     expected_size: u64,
     cancel: &AtomicBool,
