@@ -1,4 +1,4 @@
-use crate::scan::{FileResult, ScanProgress};
+use crate::scan::{content_status, FileResult, ScanProgress};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -27,6 +27,7 @@ pub struct SearchReport {
     pub truncated: bool,
 }
 
+#[cfg(test)]
 pub fn search(request: SearchRequest) -> Result<SearchReport, String> {
     search_with_control(request, &AtomicBool::new(false), |_| {})
 }
@@ -50,21 +51,33 @@ pub fn search_with_control(
             RegexBuilder::new(p).case_insensitive(true).size_limit(4 * 1024 * 1024)
                 .build().map_err(|e| format!("Regex inválida: {e}"))
         }).transpose()?;
-    let max_files = request.max_files.unwrap_or(250_000).clamp(1, 1_000_000);
+    if request.max_files == Some(0) {
+        return Err("O limite de arquivos deve ser maior que zero.".into());
+    }
+    // Without an explicitly requested sample, enumerate the entire
+    // accessible tree while retaining only the 500 highest-ranked matches.
+    let max_files = request.max_files;
     let min_size = request.min_size_bytes.unwrap_or(0);
     let mut top = BTreeMap::<(u64, String), FileResult>::new();
     let (mut files_scanned, mut total_matches, mut errors) = (0, 0, 0);
     let mut truncated = false;
-    for entry in WalkDir::new(&root).follow_links(false) {
+    let mut walker = WalkDir::new(&root).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
         if cancel.load(Ordering::Relaxed) {
             return Err("Operação cancelada pelo usuário.".into());
         }
         let entry = match entry { Ok(e) => e, Err(_) => { errors += 1; continue; } };
-        if !entry.file_type().is_file() { continue; }
-        if files_scanned >= max_files { truncated = true; break; }
-        let metadata = match entry.metadata() {
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
             Ok(m) => m, Err(_) => { errors += 1; continue; }
         };
+        if entry.file_type().is_symlink() { continue; }
+        if entry.file_type().is_dir() {
+            // Avoid recursing into Windows junctions / cloud reparse trees.
+            if content_status(&metadata) != "local" { walker.skip_current_dir(); }
+            continue;
+        }
+        if !entry.file_type().is_file() { continue; }
+        if max_files.is_some_and(|limit| files_scanned >= limit) { truncated = true; break; }
         files_scanned += 1;
         if last_update.elapsed() >= Duration::from_millis(250) {
             progress(ScanProgress {
@@ -85,6 +98,7 @@ pub fn search_with_control(
         top.insert((size, path.clone()), FileResult {
             name: entry.file_name().to_string_lossy().into_owned(),
             path, size_bytes: size, extension,
+            content_status: content_status(&metadata).to_owned(),
         });
         if top.len() > 500 { top.pop_first(); }
     }
@@ -118,6 +132,22 @@ mod tests {
             regex: None, min_size_bytes: None, max_files: None,
         }, &cancelled, |_| {});
         assert!(result.unwrap_err().contains("cancelada"));
+    }
+
+    #[test]
+    fn unlimited_search_counts_all_results_but_keeps_only_top_500() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..520 {
+            fs::write(dir.path().join(format!("item_{i:04}")), [i as u8]).unwrap();
+        }
+        let report = search(SearchRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: None,
+        }).unwrap();
+        assert_eq!(report.files_scanned, 520);
+        assert_eq!(report.total_matches, 520);
+        assert_eq!(report.matches.len(), 500);
+        assert!(!report.truncated);
     }
 
     #[test]
