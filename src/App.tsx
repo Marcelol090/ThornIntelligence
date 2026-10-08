@@ -8,7 +8,7 @@ import {
   Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanRequest, Section } from './types';
+import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -74,6 +74,8 @@ function DuplicateCard({ group, copy }: { group: DuplicateGroup; copy: (path: st
 export default function App() {
   const [section, setSection] = useState<Section>('overview');
   const [report, setReport] = useState<ScanReport | null>(null);
+  const [searchResult, setSearchResult] = useState<SearchReport | null>(null);
+  const [searchBusy, setSearchBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
@@ -112,9 +114,35 @@ export default function App() {
       const request: ScanRequest = { root: path, regex: pattern.trim() || null, minSizeBytes: Math.floor(parsed * 1024 * 1024), maxFiles: 250_000 };
       const result = await invoke<ScanReport>('scan_path', { request });
       setReport(result);
+      setSearchResult(null);
       setToast('Análise concluída em ' + duration(result.elapsedMs) + '.');
     } catch (err) { setError(String(err)); }
     finally { setBusy(false); }
+  }
+
+  async function searchMetadata() {
+    if (!report) return;
+    setError('');
+    setSearchBusy(true);
+    try {
+      const parsed = Number(minMb);
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > Number.MAX_SAFE_INTEGER / 1048576) {
+        throw new Error('Tamanho mínimo inválido.');
+      }
+      const request: SearchRequest = {
+        root: report.root,
+        regex: regex.trim() || null,
+        minSizeBytes: Math.floor(parsed * 1048576),
+        maxFiles: 250_000,
+      };
+      const result = await invoke<SearchReport>('search_path', { request });
+      setSearchResult(result);
+      setToast('Busca por metadados concluída em ' + duration(result.elapsedMs) + '.');
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSearchBusy(false);
+    }
   }
 
   async function checkDiskHealth() {
@@ -238,14 +266,15 @@ export default function App() {
         {section === 'search' && report && <div className="stack-gap">
           <section className="panel glass search-panel">
             <SectionHeading kicker="BUSCA AVANÇADA" title="Pesquisa por Regex + tamanho" description="Filtre todo o escopo escolhido pelo nome/caminho, não apenas os arquivos visíveis."/>
-            <form className="search-form" onSubmit={(event: FormEvent) => { event.preventDefault(); void scanFolder(report.root, regex, minMb); }}>
+            <form className="search-form" onSubmit={(event: FormEvent) => { event.preventDefault(); void searchMetadata(); }}>
               <label className="field"><span>Expressão regular (nome ou caminho)</span><div className="input-wrap"><Search size={19}/><input type="text" placeholder="Ex.: \\.(iso|zip|mp4)$" value={regex} onChange={(e) => setRegex(e.target.value)} spellCheck={false}/></div></label>
               <label className="field min-field"><span>Tamanho mínimo (MB)</span><div className="input-wrap"><SlidersHorizontal size={18}/><input type="number" min="0" step="1" value={minMb} onChange={(e) => setMinMb(e.target.value)}/></div></label>
-              <button className="primary-button" type="submit" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17}/> : <Search size={17}/>} Buscar</button>
+              <button className="primary-button" type="submit" disabled={searchBusy}>{searchBusy ? <LoaderCircle className="spin" size={17}/> : <Search size={17}/>} {searchBusy ? 'Buscando…' : 'Buscar'}</button>
             </form>
-            <p className="panel-note"><LockKeyhole size={14}/> Pesquisa no sistema de arquivos local, sem indexação em nuvem. Regex usa a sintaxe do Rust regex.</p>
+            <p className="panel-note"><LockKeyhole size={14}/> Busca somente por metadados: não abre conteúdo, não recalcula hashes e preserva o relatório de duplicados. Regex usa a sintaxe do Rust regex.</p>
           </section>
-          <section className="panel glass"><SectionHeading kicker="RESULTADOS DE PESQUISA" title={number(report.totalMatches) + ' arquivos encontrados'} description="Exibindo até 500 resultados, em ordem decrescente de tamanho."/><FileRows files={report.matches} copy={copy}/></section>
+          {searchResult && (searchResult.truncated || searchResult.errors > 0) && <div className="alert warning-alert"><Info size={18}/><span>Busca parcial: {searchResult.truncated ? 'limite de arquivos atingido. ' : ''}{searchResult.errors > 0 ? number(searchResult.errors) + ' entradas inacessíveis.' : ''}</span></div>}
+          <section className="panel glass"><SectionHeading kicker="RESULTADOS DE PESQUISA" title={number(searchResult?.totalMatches ?? report.totalMatches) + ' arquivos encontrados'} description="Exibindo até 500 resultados, em ordem decrescente de tamanho."/><FileRows files={searchResult?.matches ?? report.matches} copy={copy}/></section>
         </div>}
 
         {section === 'optimize' && <div className="stack-gap">

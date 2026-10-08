@@ -54,6 +54,23 @@ export interface ScanRequest {
   maxFiles: number;
 }
 
+export interface SearchRequest {
+  root: string;
+  regex: string | null;
+  minSizeBytes: number;
+  maxFiles: number;
+}
+
+export interface SearchReport {
+  root: string;
+  filesScanned: number;
+  totalMatches: number;
+  matches: FileResult[];
+  elapsedMs: number;
+  errors: number;
+  truncated: boolean;
+}
+
 export interface DiskHealth {
   drive: string;
   model: string | null;
