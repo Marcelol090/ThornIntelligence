@@ -1,7 +1,8 @@
 use blake3::Hasher;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use same_file::Handle;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ use walkdir::WalkDir;
 const MAX_HASH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_RESULTS: usize = 300;
 const MAX_MATCHES: usize = 500;
+// Avoid exhausting OS handles when inspecting huge identical-content groups.
+const MAX_IDENTITY_GROUP_FILES: usize = 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,6 +71,7 @@ pub struct ScanReport {
     pub error_samples: Vec<String>,
     pub truncated: bool,
     pub duplicate_analysis_complete: bool,
+    pub hardlink_aliases: usize,
     pub hash_bytes_read: u64,
     pub top_files: Vec<FileResult>,
     pub top_directories: Vec<DirectoryResult>,
@@ -244,7 +248,10 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
 
     let mut size_buckets = HashMap::<u64, Vec<&FileRecord>>::new();
     for record in &records {
-        size_buckets.entry(record.size).or_default().push(record);
+        // Empty files consume no content bytes and are not space-saving candidates.
+        if record.size > 0 {
+            size_buckets.entry(record.size).or_default().push(record);
+        }
     }
     let mut candidate_buckets: Vec<_> = size_buckets.into_iter()
         .filter(|(_, files)| files.len() > 1)
@@ -276,13 +283,57 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
         }
     }
 
-    let mut duplicates: Vec<DuplicateGroup> = groups.into_iter()
-        .filter(|(_, paths)| paths.len() >= 2)
-        .map(|((size_bytes, hash), copies)| {
-            let potential_savings_bytes = size_bytes.saturating_mul((copies.len() - 1) as u64);
-            DuplicateGroup { hash, size_bytes, copies, potential_savings_bytes }
-        })
-        .collect();
+    let mut hardlink_aliases = 0_usize;
+    let mut duplicates = Vec::<DuplicateGroup>::new();
+    for ((size_bytes, hash), copies) in groups {
+        if copies.len() < 2 {
+            continue;
+        }
+        if copies.len() > MAX_IDENTITY_GROUP_FILES {
+            // Don't open an unbounded number of handles. Missing results are
+            // flagged rather than presenting an unsafe savings estimate.
+            duplicate_analysis_complete = false;
+            continue;
+        }
+
+        let mut unique_files = HashSet::<Handle>::new();
+        let mut independently_allocated = Vec::<String>::new();
+        let mut identity_verified = true;
+        for path in copies {
+            match Handle::from_path(&path) {
+                Ok(handle) if unique_files.insert(handle) => {
+                    independently_allocated.push(path);
+                }
+                Ok(_) => {
+                    hardlink_aliases += 1;
+                }
+                Err(err) => {
+                    errors += 1;
+                    if error_samples.len() < 12 {
+                        error_samples.push(format!("Identidade física {}: {err}", path));
+                    }
+                    identity_verified = false;
+                    break;
+                }
+            }
+        }
+        if !identity_verified {
+            duplicate_analysis_complete = false;
+            continue;
+        }
+        if independently_allocated.len() < 2 {
+            continue; // Hardlink aliases do not release bytes independently.
+        }
+        let potential_savings_bytes = size_bytes.saturating_mul(
+            (independently_allocated.len() - 1) as u64
+        );
+        duplicates.push(DuplicateGroup {
+            hash,
+            size_bytes,
+            copies: independently_allocated,
+            potential_savings_bytes,
+        });
+    }
     duplicates.sort_unstable_by(|a, b| b.potential_savings_bytes.cmp(&a.potential_savings_bytes));
     let potential_savings_bytes = duplicates.iter()
         .fold(0_u64, |total, item| total.saturating_add(item.potential_savings_bytes));
@@ -298,6 +349,7 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
         error_samples,
         truncated,
         duplicate_analysis_complete,
+        hardlink_aliases,
         hash_bytes_read: hashed_bytes,
         top_files,
         top_directories,
@@ -332,6 +384,66 @@ mod tests {
         assert_eq!(report.duplicates.len(), 1);
         assert_eq!(report.duplicates[0].copies.len(), 2);
         assert!(!report.truncated);
+    }
+
+
+    #[test]
+    fn hardlinks_do_not_create_fictitious_recoverable_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.dat");
+        let alias = dir.path().join("alias.dat");
+        fs::write(&original, "same physical bytes").unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+
+        let report = scan(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None,
+            min_size_bytes: None,
+            max_files: None,
+        }).unwrap();
+
+        assert_eq!(report.files_scanned, 2);
+        assert_eq!(report.hardlink_aliases, 1);
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.potential_savings_bytes, 0);
+        assert!(report.duplicate_analysis_complete);
+    }
+
+    #[test]
+    fn hardlinks_and_independent_copies_are_not_confused() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.dat");
+        fs::write(&original, "matching bytes").unwrap();
+        fs::hard_link(&original, dir.path().join("alias.dat")).unwrap();
+        fs::copy(&original, dir.path().join("copy.dat")).unwrap();
+
+        let report = scan(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None,
+            min_size_bytes: None,
+            max_files: None,
+        }).unwrap();
+
+        assert_eq!(report.hardlink_aliases, 1);
+        assert_eq!(report.duplicates.len(), 1);
+        assert_eq!(report.duplicates[0].copies.len(), 2);
+        assert_eq!(report.potential_savings_bytes, "matching bytes".len() as u64);
+    }
+
+    #[test]
+    fn empty_files_are_excluded_from_space_savings() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("empty_1"), "").unwrap();
+        fs::write(dir.path().join("empty_2"), "").unwrap();
+        let report = scan(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None,
+            min_size_bytes: None,
+            max_files: None,
+        }).unwrap();
+        assert_eq!(report.files_scanned, 2);
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.potential_savings_bytes, 0);
     }
 
     #[test]

@@ -33,7 +33,7 @@ O código ainda está em uma branch de feature, que deverá ser revisada antes d
 1. Seleção da pasta via diálogo nativo (sem salvar o conteúdo na nuvem).
 2. Varredura de tamanho lógico, total de arquivos, maiores diretórios, ranking de arquivos e distribuição por extensão.
 3. Filtro por expressão regular no caminho/nome e tamanho mínimo em MB.
-4. Identificação de duplicados **exatos**: primeiro agrupa por tamanho e depois confirma com hash completo BLAKE3, dentro do limite de leitura.
+4. Identificação de duplicados **exatos**: primeiro agrupa por tamanho e depois confirma com hash completo BLAKE3, dentro do limite de leitura. Verifica identidade física com `same-file`, descarta aliases de hardlinks e ignora arquivos vazios nas economias estimadas.
 5. Visão de grupos duplicados, hash e caminhos para revisão manual — **sem botão de exclusão**.
 6. Análise de fragmentação do volume no Windows e otimização explícita via PowerShell, com política do próprio Windows para HDD/SSD/tiered.
 7. Mensagens visíveis para entradas inacessíveis, varreduras truncadas e análise de hash parcial.
@@ -47,6 +47,8 @@ O código ainda está em uma branch de feature, que deverá ser revisada antes d
 - Exibe até 300 maiores arquivos, 300 diretórios, 300 grupos duplicados e 500 correspondências de busca.
 - Leitura direta local, sem indexação persistente nesta versão; cada nova busca executa nova varredura.
 - Não segue symlinks. Erros de acesso são contabilizados.
+- Até 1.024 referências por grupo de hash para a identificação de hardlinks. Grupos maiores ou identidades inacessíveis são omitidos da estimativa e sinalizados como análise parcial.
+- O módulo de hardlinks usa identificadores de arquivo fornecidos pelo SO; sistemas de arquivos específicos podem ter limitações, portanto nenhuma limpeza destrutiva é autorizada automaticamente.
 - O scanner é assíncrono do ponto de vista da UI, mas ainda não implementa cancelamento, progresso incremental ou snapshot SQLite.
 - O módulo de otimização é Windows-only. Não força `-Defrag` em SSD, não eleva privilégios e não agenda tarefas automaticamente.
 - Funcionalidade de pré-visualização do impacto, métricas SMART, snapshot SQLite incremental, content-grep e tratamentos de hardlinks estão planejados.

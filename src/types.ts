@@ -35,6 +35,7 @@ export interface ScanReport {
   errorSamples: string[];
   truncated: boolean;
   duplicateAnalysisComplete: boolean;
+  hardlinkAliases: number;
   hashBytesRead: number;
   topFiles: FileResult[];
   topDirectories: DirectoryResult[];

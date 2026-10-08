@@ -15,7 +15,8 @@ React/Tauri Window
  │         ├── metadados e somatórios de diretórios
  │         ├── Regex de caminho e filtro de tamanho
  │         ├── grupos candidatos por tamanho
- │         └── BLAKE3 de conteúdo (até 8 GiB lidos)
+ │         ├── BLAKE3 de conteúdo (até 8 GiB lidos)
+ │         └── identidade do arquivo (same-file) para descartar hardlinks
  └── optimize_volume({drive,execute})
       └── Windows PowerShell > Optimize-Volume
            ├── execute=false: -Analyze
@@ -33,6 +34,7 @@ O frontend recebe relatórios serializados (camelCase) e apresenta **apenas info
 - Respeitar privilégios do usuário e mostrar falhas de permissão.
 - Não seguir junctions/symlinks durante a varredura nem atravessar outros destinos intencionalmente por links.
 - Não afirmar economia física: APFS/NTFS sparse/reparse/hardlinks/compressão alteram cálculo real.
+- Descartar hardlink aliases na estimativa com verificação de identidade via `same-file`; impor limite de descritores e marcar grupos não verificados como parciais.
 - Não declarar duplicação por nome/tamanho/partial hash apenas: o candidato exige digest integral; hashes são uma evidência forte, não verificação byte a byte para situações adversariais.
 - Sem comandos genéricos digitados pelo usuário, sem execução remota.
 
