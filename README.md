@@ -229,3 +229,11 @@ A tela **Explorador → Árvore indexada por diretório** complementa o antigo r
 Foram adicionados testes Rust para pastas vazias, agregação de tamanhos, paginação estável em páginas de um item, diretórios fora da raiz, cursores inválidos, cancelamento mantendo o snapshot anterior e invalidação de cursor após nova geração. **A compilação Rust e os ensaios NVMe ainda não foram realizados** devido ao bloqueio anterior dos runners Windows. Medir latência por clique, IOPS, tamanho do WAL e RAM antes/depois com >250 mil arquivos; validar OneDrive, Unicode, diretórios profundos, muitos filhos e grandes snapshots.
 
 Referências pesquisadas com Exa/GitHub: https://github.com/0xf0f/sqlite-file-index ; https://github.com/jpgneves/minidex ; https://github.com/TanStack/virtual ; https://github.com/jameskerr/react-arborist ; https://github.com/Swatto86/AllTheThings ; https://github.com/Ryan-Sayer/strata . Os algoritmos MFT/USN são uma prioridade posterior, pois exigem acesso NTFS apropriado e fallback.
+
+### Reabrir índices existentes sem revarrer a unidade (commit complementar)
+
+O Explorador passa a consultar os **até 100 escopos SQLite publicados mais recentes** e oferece um seletor de pastas já indexadas. A lista é lida em conexão SQLite somente leitura, sem executar WalkDir, BLAKE3, migração, escrita ou atualização de metadados do filesystem. Selecionar um índice abre diretamente sua árvore persistida, mesmo após reiniciar o Thorn, sem criar um novo ScanReport. Os relatórios do ranking de arquivos grandes continuam associados apenas ao escopo de seu último scan — não são misturados com outro índice selecionado.
+
+A listagem indica índices antigos que precisam ser atualizados para materializar a árvore. O usuário pode indexar novamente pelo botão da própria árvore; nenhuma indexação é disparada automaticamente ao reabrir o programa. Existe teste Rust cobrindo índice ausente (sem criar banco) e uma atualização seguida da recuperação do escopo salvo. O snapshot é histórico e pode estar desatualizado em relação ao disco.
+
+Fontes já pesquisadas por Exa/GitHub: file-index e minidex (índices persistentes), TanStack Virtual e react-arborist (árvores responsivas), AllTheThings e Strata (integração futura de MFT/USN).

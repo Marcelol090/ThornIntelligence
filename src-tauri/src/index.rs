@@ -66,6 +66,15 @@ pub struct TreeNode {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct IndexedScope {
+    pub root: String,
+    pub files: u64,
+    pub completed_at_unix: i64,
+    pub has_tree: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TreePage {
     pub root: String,
     pub parent_path: String,
@@ -501,6 +510,50 @@ pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSea
     })
 }
 
+/// List already-published SQLite scopes without enumerating folders.
+/// This powers instant snapshot reopening after the application restarts.
+pub fn list_scopes(db_path: &Path) -> Result<Vec<IndexedScope>, String> {
+    if !db_path.is_file() { return Ok(Vec::new()); }
+    let conn=Connection::open_with_flags(
+        db_path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).map_err(db_err)?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(db_err)?;
+    let has_scopes: bool=conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+         WHERE type='table' AND name='indexed_scopes')",
+        [], |r| r.get(0),
+    ).map_err(db_err)?;
+    if !has_scopes { return Ok(Vec::new()); }
+    let has_directory_table: bool=conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+         WHERE type='table' AND name='indexed_directories')",
+        [], |r| r.get(0),
+    ).map_err(db_err)?;
+    let mut stmt=conn.prepare(
+        "SELECT root,generation,completed_at_unix,file_count
+         FROM indexed_scopes ORDER BY completed_at_unix DESC,root ASC LIMIT 100"
+    ).map_err(db_err)?;
+    let mut rows=stmt.query([]).map_err(db_err)?;
+    let mut scopes=Vec::new();
+    while let Some(row)=rows.next().map_err(db_err)? {
+        let root: String=row.get(0).map_err(db_err)?;
+        let generation: i64=row.get(1).map_err(db_err)?;
+        let completed_at_unix: i64=row.get(2).map_err(db_err)?;
+        let files: i64=row.get(3).map_err(db_err)?;
+        let has_tree=if has_directory_table {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM indexed_directories
+                 WHERE root=?1 AND path=?1 AND generation=?2)",
+                params![root,generation], |r| r.get(0),
+            ).map_err(db_err)?
+        } else { false };
+        scopes.push(IndexedScope {
+            root,files:files.max(0) as u64,completed_at_unix,has_tree,
+        });
+    }
+    Ok(scopes)
+}
+
 /// Index-backed, keyset-paginated, lazy children of one directory.
 /// This never walks the filesystem or reads user file contents.
 pub fn browse_tree(db_path: &Path, request: TreeRequest) -> Result<TreePage, String> {
@@ -633,6 +686,24 @@ mod tests {
             root:root.display().to_string(),parent_path:parent.display().to_string(),
             after,limit:Some(limit),generation,
         }
+    }
+
+    #[test]
+    fn lists_persisted_scopes_without_rescanning_the_filesystem() {
+        let tmp=tempfile::tempdir().unwrap();
+        let root=tmp.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        let db=tmp.path().join("cached.sqlite");
+        assert!(list_scopes(&db).unwrap().is_empty());
+        assert!(!db.exists());
+        fs::write(root.join("a.txt"),b"abc").unwrap();
+        refresh(&db,root.to_str().unwrap(),None,&AtomicBool::new(false),
+            &AtomicBool::new(false), |_| {}).unwrap();
+        let scopes=list_scopes(&db).unwrap();
+        assert_eq!(scopes.len(),1);
+        assert_eq!(scopes[0].files,1);
+        assert!(scopes[0].has_tree);
+        assert!(scopes[0].completed_at_unix>0);
     }
 
     #[test]

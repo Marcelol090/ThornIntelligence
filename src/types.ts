@@ -201,6 +201,12 @@ export interface TreeNode {
   files: number;
   contentStatus: 'local' | 'offline' | 'reparse';
 }
+export interface IndexedScope {
+  root: string;
+  files: number;
+  completedAtUnix: number;
+  hasTree: boolean;
+}
 export interface TreePage {
   root: string;
   parentPath: string;

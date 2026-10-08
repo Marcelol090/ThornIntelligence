@@ -377,3 +377,13 @@ html.native-vibrancy .glass-inset{
 .indexed-tree-size small{color:#8ea6bf;font-size:10px}
 @media(max-width:660px){.indexed-tree-row{padding-right:8px;font-size:11px}
  .indexed-tree-size small{display:none}}
+
+/* Cached SQLite scopes, browseable without a new filesystem scan. */
+.indexed-scopes-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin:10px 0 18px}
+.indexed-scopes-controls .field{min-width:240px;flex:1}
+.indexed-scopes-controls select{width:100%;background:rgba(16,36,65,.62);
+  color:#d9e8f9;border:1px solid rgba(152,185,233,.28);
+  border-radius:10px;font:inherit;font-size:12px;padding:11px 13px;
+  min-width:0;max-width:100%;cursor:pointer}
+.indexed-scopes-controls .outline-button{height:40px}
+@media(max-width:660px){.indexed-scopes-controls .field{min-width:0;flex-basis:100%}}
