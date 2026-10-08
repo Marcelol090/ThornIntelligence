@@ -63,11 +63,15 @@ function FileRows({ files, copy, allocations }: {
       </span><span className="size-cell"><strong>{bytes(file.sizeBytes)}</strong>
         {allocations?.[file.path] && <small className="allocation-detail" title={
           allocations[file.path].status === 'measured'
-            ? 'Tamanho alocado reportado pelo Windows (GetCompressedFileSizeW)'
+            ? 'Alocação do filesystem via FileStandardInfo: não é espaço recuperável'
             : 'Medição omitida: arquivo alterado, virtual, fora do escopo ou inacessível'
         }>{allocations[file.path].allocatedBytes !== null
             ? 'Em disco: ' + bytes(allocations[file.path].allocatedBytes as number)
             : 'Em disco: indisponível'}</small>}
+        {(allocations?.[file.path]?.hardlinkCount ?? 0) > 1 && <small
+          className="allocation-detail" title="Há outras referências físicas ao mesmo arquivo, possivelmente fora desta pasta. Remover um único nome não recupera esse espaço.">
+          Compartilhado: {allocations?.[file.path]?.hardlinkCount} hardlinks · economia não atribuível
+        </small>}
       </span>
       <button className="icon-button" type="button" title="Copiar caminho" aria-label={'Copiar caminho de ' + file.name} onClick={() => copy(file.path)}><Clipboard size={16}/></button>
     </div>)}
@@ -447,8 +451,11 @@ export default function App() {
           {allocationReport && <p className="panel-note">
             Alocação consultada em {number(allocationReport.measured)} arquivos;
             {number(allocationReport.skipped)} ignorados e {number(allocationReport.failed)} indisponíveis.
+            {allocationReport.items.filter(item => (item.hardlinkCount ?? 0) > 1).length > 0 &&
+              ' ' + number(allocationReport.items.filter(item => (item.hardlinkCount ?? 0) > 1).length) + ' arquivos possuem hardlinks compartilhados.'}
             Valores restritos à lista dos 300 maiores — não são o espaço físico total da pasta
-            nem equivalem a espaço recuperável. Arquivos comprimidos/esparsos podem ter alocação inferior ao tamanho lógico.
+            nem equivalem a espaço recuperável. Hardlinks podem existir fora do escopo;
+            compressão, arquivos esparsos ou armazenamento compartilhado alteram a alocação reportada.
           </p>}
           <FileRows files={report.topFiles.filter(file =>
             cloudFilter === 'all' || file.contentStatus === cloudFilter

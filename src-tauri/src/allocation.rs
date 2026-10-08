@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const MAX_TARGETS: usize = 300;
-const MAX_PATH_UNITS: usize = 32_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +29,8 @@ pub struct AllocationItem {
     pub path: String,
     pub logical_bytes: u64,
     pub allocated_bytes: Option<u64>,
+    /// Number of paths pointing to the same file on this volume (may include outside-root aliases).
+    pub hardlink_count: Option<u32>,
     pub status: String,
 }
 
@@ -52,33 +53,59 @@ fn ensure_active(cancel: &AtomicBool) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn allocated_bytes(path: &Path) -> Result<u64, String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
-    use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+fn allocation_metadata(path: &Path, expected_size: u64) -> Result<Option<(u64, u32)>, String> {
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandleEx, FileStandardInfo, FILE_STANDARD_INFO,
+        FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
-    // Canonical paths on Windows normally use the verbatim \\?\ prefix,
-    // permitting NTFS paths beyond MAX_PATH (up to the Win32 wide limit).
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if wide.len() >= MAX_PATH_UNITS {
-        return Err("Caminho excede o limite da API Win32.".into());
+    // Query metadata via a stable handle. No read permission, content I/O,
+    // icon extraction, or fallback that could hydrate an offline placeholder.
+    // NO_RECALL is a hint to providers, not a guarantee of their behavior.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let opened = file.metadata().map_err(|e| e.to_string())?;
+    if !opened.is_file() || opened.file_type().is_symlink()
+        || content_status(&opened) != "local" || opened.len() != expected_size
+    {
+        return Ok(None);
     }
-    wide.push(0);
-    let mut high = 0u32;
-    unsafe {
-        // INVALID_FILE_SIZE (0xffffffff) can also be a valid low DWORD.
-        // SetLastError(0) makes that case distinguishable from failure.
-        SetLastError(0);
-        let low = GetCompressedFileSizeW(wide.as_ptr(), &mut high);
-        if low == u32::MAX && GetLastError() != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        Ok((u64::from(high) << 32) | u64::from(low))
+
+    let mut raw = MaybeUninit::<FILE_STANDARD_INFO>::zeroed();
+    let success = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileStandardInfo,
+            raw.as_mut_ptr().cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if success == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
     }
+    let info = unsafe { raw.assume_init() };
+    if info.Directory != 0 || info.DeletePending != 0
+        || info.EndOfFile < 0 || info.EndOfFile as u64 != expected_size
+        || info.AllocationSize < 0 || info.NumberOfLinks == 0
+    {
+        return Ok(None);
+    }
+
+    // Both fields come from the same file handle and cannot be mistaken
+    // for independently recoverable capacity when hardlinks are present.
+    Ok(Some((info.AllocationSize as u64, info.NumberOfLinks)))
 }
 
 #[cfg(not(windows))]
-fn allocated_bytes(_: &Path) -> Result<u64, String> {
+fn allocation_metadata(_: &Path, _: u64) -> Result<Option<(u64, u32)>, String> {
     Err("A medição de alocação requer a API nativa do Windows.".into())
 }
 
@@ -119,6 +146,7 @@ pub fn measure(
             path: target.path,
             logical_bytes: target.expected_size_bytes,
             allocated_bytes: None,
+            hardlink_count: None,
             status: "unsupported".into(),
         };
         if !path.is_absolute() {
@@ -150,11 +178,16 @@ pub fn measure(
                             Ok(now) if now.file_type().is_file()
                                 && content_status(&now) == "local"
                                 && now.len() == item.logical_bytes => {
-                                match allocated_bytes(&canonical) {
-                                    Ok(bytes) => {
+                                match allocation_metadata(&canonical, item.logical_bytes) {
+                                    Ok(Some((bytes, links))) => {
                                         item.allocated_bytes = Some(bytes);
+                                        item.hardlink_count = Some(links);
                                         item.status = "measured".into();
                                         measured += 1;
+                                    }
+                                    Ok(None) => {
+                                        item.status = "changed".into();
+                                        skipped += 1;
                                     }
                                     Err(_) => {
                                         item.status = "unavailable".into();
@@ -213,9 +246,34 @@ mod tests {
             assert_eq!(report.measured, 1);
             assert_eq!(report.items[0].status, "measured");
             assert!(report.items[0].allocated_bytes.is_some());
+            assert_eq!(report.items[0].hardlink_count, Some(1));
         }
         #[cfg(not(windows))]
         assert_eq!(report.failed, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardlinked_paths_share_allocation_and_expose_link_count() {
+        let (dir, file) = fixture();
+        let alias = dir.path().join("alias.bin");
+        fs::hard_link(&file, &alias).unwrap();
+        let report = measure(AllocationRequest {
+            root: dir.path().display().to_string(),
+            targets: vec![
+                AllocationTarget {
+                    path: file.display().to_string(),
+                    expected_size_bytes: 8192,
+                },
+                AllocationTarget {
+                    path: alias.display().to_string(),
+                    expected_size_bytes: 8192,
+                },
+            ],
+        }, &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(report.measured, 2);
+        assert_eq!(report.items[0].allocated_bytes, report.items[1].allocated_bytes);
+        assert!(report.items.iter().all(|item| item.hardlink_count.unwrap_or(0) >= 2));
     }
 
     #[test]
