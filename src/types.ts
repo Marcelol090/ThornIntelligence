@@ -53,6 +53,23 @@ export interface ScanRequest {
   maxFiles: number;
 }
 
+export interface DiskHealth {
+  drive: string;
+  model: string | null;
+  busType: string | null;
+  diskNumber: number | null;
+  healthStatus: string | null;
+  operationalStatus: string | null;
+  sizeBytes: number | null;
+  freeBytes: number | null;
+  temperatureC: number | null;
+  wearPercent: number | null;
+  readErrorsUncorrected: number | null;
+  writeErrorsUncorrected: number | null;
+  powerOnHours: number | null;
+  reliabilityAvailable: boolean;
+}
+
 export interface OptimizationResult {
   drive: string;
   executed: boolean;

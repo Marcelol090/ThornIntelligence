@@ -37,6 +37,7 @@ O código ainda está em uma branch de feature, que deverá ser revisada antes d
 5. Visão de grupos duplicados, hash e caminhos para revisão manual — **sem botão de exclusão**.
 6. Análise de fragmentação do volume no Windows e otimização explícita via PowerShell, com política do próprio Windows para HDD/SSD/tiered.
 7. Mensagens visíveis para entradas inacessíveis, varreduras truncadas e análise de hash parcial.
+8. Diagnóstico Windows **somente leitura** por `Get-Partition`, `Get-Disk`, `Get-Volume` e `Get-StorageReliabilityCounter`, incluindo capacidade, espaço disponível, saúde geral e sensores opcionais de temperatura/desgaste/erros.
 
 **Importante:** tamanhos e economia potencial são valores lógicos; não equivalem necessariamente a blocos físicos livres (hardlinks, compressão, sparse files, deduplicação do filesystem). Não exclua arquivos somente pela semelhança de hash; verifique semântica, acesso e backup.
 
@@ -50,6 +51,7 @@ O código ainda está em uma branch de feature, que deverá ser revisada antes d
 - Até 1.024 referências por grupo de hash para a identificação de hardlinks. Grupos maiores ou identidades inacessíveis são omitidos da estimativa e sinalizados como análise parcial.
 - O módulo de hardlinks usa identificadores de arquivo fornecidos pelo SO; sistemas de arquivos específicos podem ter limitações, portanto nenhuma limpeza destrutiva é autorizada automaticamente.
 - O scanner é assíncrono do ponto de vista da UI, mas ainda não implementa cancelamento, progresso incremental ou snapshot SQLite.
+- A leitura de saúde é Windows-only, e indicadores SMART podem estar ausentes (por modelo, driver, barramento ou privilégios). Um resultado `Healthy` não é garantia de ausência de falhas.
 - O módulo de otimização é Windows-only. Não força `-Defrag` em SSD, não eleva privilégios e não agenda tarefas automaticamente.
 - Funcionalidade de pré-visualização do impacto, métricas SMART, snapshot SQLite incremental, content-grep e tratamentos de hardlinks estão planejados.
 

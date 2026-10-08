@@ -8,7 +8,7 @@ pub struct OptimizationResult {
     pub output: String,
 }
 
-fn validated_drive(input: &str) -> Result<char, String> {
+pub(crate) fn validated_drive(input: &str) -> Result<char, String> {
     let value = input.trim().trim_end_matches(':');
     if value.len() != 1 {
         return Err("Informe somente a letra da unidade, por exemplo C.".into());

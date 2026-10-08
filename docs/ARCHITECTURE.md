@@ -17,6 +17,7 @@ React/Tauri Window
  │         ├── grupos candidatos por tamanho
  │         ├── BLAKE3 de conteúdo (até 8 GiB lidos)
  │         └── identidade do arquivo (same-file) para descartar hardlinks
+ ├── disk_health({drive}) — Windows Storage read-only
  └── optimize_volume({drive,execute})
       └── Windows PowerShell > Optimize-Volume
            ├── execute=false: -Analyze
@@ -44,6 +45,7 @@ O frontend recebe relatórios serializados (camelCase) e apresenta **apenas info
 - `src/styles.css`: tokens visuais dark/glass, backdrop-filter, breakpoints, foco visível e reduced motion.
 - `src-tauri/src/scan.rs`: algoritmo de varredura/agrupamento e testes.
 - `src-tauri/src/optimize.rs`: adaptador nativo Windows e validação da letra da unidade.
+- `src-tauri/src/health.rs`: diagnóstico de capacidade e confiabilidade por comandos Windows de leitura, com sensores opcionais.
 - `src-tauri/src/lib.rs`: fronteira IPC; tarefas que leem disco ficam fora do thread principal.
 
 ## Decisões seguintes
@@ -70,3 +72,11 @@ O frontend recebe relatórios serializados (camelCase) e apresenta **apenas info
 - Segurança: zero mutações inesperadas, zero acesso à rede, operação abortável e auditável.
 
 Sem benchmark antes/depois, não afirmar superioridade numérica.
+
+## Evidências externas para roadmap (pesquisa Exa, 08/10/2026)
+
+- [Microsoft Learn: Optimize-Volume](https://learn.microsoft.com/en-us/powershell/module/storage/optimize-volume?view=windowsserver2025-ps): operações nativas dependem do tipo de volume/mídia. Evitar desfragmentação indiscriminada em SSD.
+- [Microsoft Learn: Get-StorageReliabilityCounter](https://learn.microsoft.com/en-us/powershell/module/storage/get-storagereliabilitycounter?view=windowsserver2025-ps): temperatura, desgaste, erros e horas de uso dependem de suporte do dispositivo/driver; valores ausentes devem permanecer indisponíveis.
+- [WinDirStat #340](https://github.com/windirstat/windirstat/issues/340) e [#108](https://github.com/windirstat/windirstat/issues/108): preocupações concretas com hardlinks e contabilidade de espaço físico.
+- [Microsoft Q&A — hidden / unknown space](https://learn.microsoft.com/en-us/answers/questions/1688633/mismatch-of-used-disk-space-unknown-files-in-windi): demanda por explicação de diferenças entre alocação física e soma lógica; planejar diagnóstico de NTFS, VSS, metadados, permissões e arquivos especiais.
+- [rsdirstat: cloud placeholders](https://github.com/rikshot/rsdirstat/commit/1faa0b3d1cc8b5dfb968ab598c127a8daf45898b): arquivos de nuvem sob demanda e reparse points exigem tratamento especial de tamanho alocado e recursão.

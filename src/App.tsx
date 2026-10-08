@@ -8,7 +8,7 @@ import {
   Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanRequest, Section } from './types';
+import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanRequest, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -83,6 +83,8 @@ export default function App() {
   const [confirmOptimize, setConfirmOptimize] = useState(false);
   const [optimization, setOptimization] = useState<OptimizationResult | null>(null);
   const [optimizing, setOptimizing] = useState(false);
+  const [diskHealth, setDiskHealth] = useState<DiskHealth | null>(null);
+  const [healthBusy, setHealthBusy] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
 
   async function copy(value: string) {
@@ -113,6 +115,20 @@ export default function App() {
       setToast('Análise concluída em ' + duration(result.elapsedMs) + '.');
     } catch (err) { setError(String(err)); }
     finally { setBusy(false); }
+  }
+
+  async function checkDiskHealth() {
+    setError('');
+    setDiskHealth(null);
+    setHealthBusy(true);
+    try {
+      const health = await invoke<DiskHealth>('disk_health', { drive });
+      setDiskHealth(health);
+    } catch (err) {
+      setError('O diagnóstico não pôde ser concluído: ' + String(err));
+    } finally {
+      setHealthBusy(false);
+    }
   }
 
   async function runOptimization(execute: boolean) {
@@ -234,8 +250,26 @@ export default function App() {
 
         {section === 'optimize' && <div className="stack-gap">
           <div className="optimizer-header glass"><div className="optimization-visual"><span className="optimization-glow"/><HardDrive size={54}/></div><div><Tag tone="mint"><ShieldCheck size={13}/> POLÍTICA DE SEGURANÇA</Tag><h2>Otimização por tipo de mídia.</h2><p>O Windows escolhe a ação adequada ao volume. HDD pode receber desfragmentação; SSD compatível recebe ReTRIM. Nunca forçamos a desfragmentação de SSD.</p></div></div>
+          <section className="panel glass health-panel">
+            <SectionHeading kicker="DIAGNÓSTICO SOMENTE LEITURA" title="Saúde e capacidade do disco" description="Consulta dados reais do Windows Storage para a unidade selecionada. Nenhum reparo ou teste de estresse é iniciado." right={<button type="button" className="outline-button" disabled={healthBusy} onClick={() => void checkDiskHealth()}>{healthBusy ? <LoaderCircle size={16} className="spin"/> : <Activity size={16}/>} Consultar saúde</button>}/>
+            {diskHealth ? <>
+              <div className="health-summary"><HardDrive size={19}/><strong>{diskHealth.model || 'Disco sem identificação'}</strong><Tag tone={diskHealth.healthStatus === 'Healthy' ? 'green' : 'amber'}>{diskHealth.healthStatus || 'Estado desconhecido'}</Tag><span>{diskHealth.busType || 'Barramento desconhecido'}</span></div>
+              <div className="health-grid">
+                <div><small>Capacidade</small><strong>{diskHealth.sizeBytes == null ? 'Indisponível' : bytes(diskHealth.sizeBytes)}</strong></div>
+                <div><small>Espaço livre</small><strong>{diskHealth.freeBytes == null ? 'Indisponível' : bytes(diskHealth.freeBytes)}</strong></div>
+                <div><small>Temperatura</small><strong>{diskHealth.temperatureC == null ? 'Indisponível' : diskHealth.temperatureC + ' °C'}</strong></div>
+                <div><small>Desgaste reportado</small><strong>{diskHealth.wearPercent == null ? 'Indisponível' : diskHealth.wearPercent + '%'}</strong></div>
+                <div><small>Erros de leitura não corrigidos</small><strong>{diskHealth.readErrorsUncorrected == null ? 'Indisponível' : number(diskHealth.readErrorsUncorrected)}</strong></div>
+                <div><small>Erros de gravação não corrigidos</small><strong>{diskHealth.writeErrorsUncorrected == null ? 'Indisponível' : number(diskHealth.writeErrorsUncorrected)}</strong></div>
+                <div><small>Horas ligado</small><strong>{diskHealth.powerOnHours == null ? 'Indisponível' : number(diskHealth.powerOnHours)}</strong></div>
+                <div><small>Estado operacional</small><strong>{diskHealth.operationalStatus || 'Indisponível'}</strong></div>
+              </div>
+              {!diskHealth.reliabilityAvailable && <div className="alert warning-alert health-warning"><Info size={17}/><span>O Windows não disponibilizou contadores de confiabilidade para esta unidade. Um estado geral saudável não substitui o diagnóstico SMART do fabricante.</span></div>}
+            </> : <div className="health-empty"><Activity size={21}/> Selecione a letra da unidade abaixo e consulte seus indicadores. Alguns dispositivos não disponibilizam todos os sensores.</div>}
+            <p className="panel-note"><ShieldCheck size={14}/> Valores ausentes não significam zero; Barramento NVMe/SATA não determina automaticamente o tipo de mídia. Não inferimos vida útil restante.</p>
+          </section>
           <section className="panel glass optimize-panel"><SectionHeading kicker="ADAPTADOR WINDOWS" title="Analisar ou otimizar unidade" description="Primeiro execute a análise. A otimização exige confirmação explícita e pode exigir privilégios de administrador."/>
-            <div className="optimize-controls"><label className="field"><span>Letra da unidade</span><div className="input-wrap drive-input"><Disc3 size={19}/><input maxLength={2} value={drive} onChange={(e) => setDrive(e.target.value.toUpperCase())} aria-label="Letra da unidade"/><strong>:</strong></div></label><button className="outline-button" type="button" disabled={optimizing} onClick={() => void runOptimization(false)}>{optimizing ? <LoaderCircle className="spin" size={17}/> : <Activity size={17}/>} Analisar volume</button></div>
+            <div className="optimize-controls"><label className="field"><span>Letra da unidade</span><div className="input-wrap drive-input"><Disc3 size={19}/><input maxLength={2} value={drive} onChange={(e) => { setDrive(e.target.value.toUpperCase()); setDiskHealth(null); setOptimization(null); setConfirmOptimize(false); }} aria-label="Letra da unidade"/><strong>:</strong></div></label><button className="outline-button" type="button" disabled={optimizing} onClick={() => void runOptimization(false)}>{optimizing ? <LoaderCircle className="spin" size={17}/> : <Activity size={17}/>} Analisar volume</button></div>
             <label className="confirm-box"><input type="checkbox" checked={confirmOptimize} onChange={(e) => setConfirmOptimize(e.target.checked)}/><span>Entendo que a otimização modifica a disposição física/lógica de dados do volume e pode exigir administrador. Fiz backup dos dados importantes.</span></label>
             <button className="primary-button optimize-action" type="button" disabled={optimizing || !confirmOptimize || !optimization || optimization.executed || optimization.drive !== drive.trim().replace(':', '').toUpperCase()} onClick={() => void runOptimization(true)}><WandSparkles size={18}/> Iniciar otimização pelo Windows <ArrowRight size={17}/></button>
             {optimization && <div className="command-output"><strong><Check size={17}/> {optimization.executed ? 'Otimização solicitada' : 'Análise concluída'} — unidade {optimization.drive}:</strong><pre>{optimization.output}</pre></div>}
