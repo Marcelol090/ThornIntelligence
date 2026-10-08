@@ -284,7 +284,8 @@ export default function App() {
               {scanProgress && scanProgress.hashBytesRead > 0 ? ' · ' + bytes(scanProgress.hashBytesRead) + ' lidos por hash' : ''}
             </small>
           </div>
-          <button type="button" className="outline-button" disabled={cancelRequested}
+          <button type="button" className="outline-button" disabled={cancelRequested || !scanProgress}
+            title={!scanProgress ? 'Aguardando inicialização no backend' : 'Interromper a operação atual'}
             onClick={() => void cancelCurrentScan()}>
             {cancelRequested ? 'Cancelando…' : 'Cancelar'}
           </button>
