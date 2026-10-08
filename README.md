@@ -160,3 +160,15 @@ Na aba **Explorador**, o botão **Medir espaço em disco** consulta sob demanda 
 **Fontes técnicas obtidas via Exa:** [Microsoft GetCompressedFileSizeW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getcompressedfilesizew), [Microsoft sparse file size](https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-the-size-of-a-sparse-file), [windows-sys Win32 examples](https://docs.rs/crate/zccache/latest/source/src/platform/platform_win/fs/volume.rs).
 
 **Evidências da atribuição por hardlinks (Exa):** [Microsoft FILE_STANDARD_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_standard_info), [Microsoft CreateFileW — acesso zero e abertura de reparse point](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew), [WinDirStat #340 — contagem de hardlinks](https://github.com/windirstat/windirstat/issues/340), [WinDirStat #416 — downloads indesejados do OneDrive](https://github.com/windirstat/windirstat/issues/416).
+
+## Diagnóstico de transparência Windows (08/10/2026)
+
+Ao executar um binário compilado da `main` antiga, o Thorn ainda usa `"backgroundColor": "#080d1a"` e não chama `setEffects`. A janela fica opaca mesmo que os cartões usem CSS `backdrop-filter`.
+
+Na branch deste PR, `tauri.conf.json` usa `transparent: true` e a capability `core:window:allow-set-effects`. O frontend solicita `Effect.Acrylic` primeiro (Windows 10/11) e `Effect.Mica` como alternativa (Windows 11), com `EffectState.Active`. O CSS aplica fundos translúcidos antes da chamada nativa e deixa `html` e `#root` transparentes; fundos escuros sólidos são preservados somente para o modo sem suporte.
+
+O topo da janela agora mostra **Acrylic solicitado** quando a chamada retorna sem erro e **Vidro indisponível** se ocorrer uma exceção. `Acrylic solicitado` não é garantia de que o DWM/WebView2 realmente desenhou transparência (nem de que o fallback usado foi Acrylic); é apenas diagnóstico da API. Detalhes da falha aparecem no tooltip e no console. O status depende da configuração do Windows e do runtime WebView2.
+
+**Roteiro de validação Windows:** (1) `git fetch origin`, `git switch feat/native-glass-adaptive-scanner`, `git pull --ff-only`; (2) `npm install` e `npm run tauri dev` ou rebuild Release após atualizar a branch; (3) verificar Settings → Personalization → Colors → Transparency effects; (4) confirmar Windows 10/11 e runtime WebView2; (5) comparar aparência da janela em frente a um wallpaper colorido e outra janela; (6) abrir DevTools/logs se indicar indisponibilidade; (7) registrar comportamento com múltiplos monitores, maximização, drag e resize. Alguns builds recentes do WebView2/Windows 11 podem deixar Mica opaco independentemente da solicitação correta.
+
+**Fontes pesquisadas com Exa:** [Tauri 2 setEffects](https://v2.tauri.app/reference/javascript/api/namespacewindow/), [window-vibrancy](https://github.com/tauri-apps/window-vibrancy), [MicrosoftEdge/WebView2Feedback #5409](https://github.com/MicrosoftEdge/WebView2Feedback/issues/5409). As alterações ainda requerem compilação e teste visual em Windows e não foram incorporadas à `main`.

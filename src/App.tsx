@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
 import { Channel, invoke } from '@tauri-apps/api/core';
-import { Effect, getCurrentWindow } from '@tauri-apps/api/window';
+import { Effect, EffectState, getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
   Activity, AlertCircle, ArrowRight, ArrowUpRight,
@@ -115,25 +115,39 @@ export default function App() {
   const [allocationBusy, setAllocationBusy] = useState(false);
   const [allocationReport, setAllocationReport] = useState<AllocationReport | null>(null);
   const [mobileMenu, setMobileMenu] = useState(false);
+  const [windowEffectStatus, setWindowEffectStatus] = useState<'pending' | 'requested' | 'failed'>('pending');
+  const [windowEffectError, setWindowEffectError] = useState('');
 
-  // Native DWM Mica (Windows 11), with Acrylic fallback (Windows 10).
-  // Tauri must create a transparent window; the page needs transparent layers.
-  // If unsupported or refused by the OS, keep the existing opaque dark theme.
+  // Acrylic is the visibly translucent Windows 10/11 backdrop; Mica is
+  // a native Windows 11 fallback, not the same as seeing the desktop.
+  // Tauri's window must have transparent:true, and every WebView root
+  // layer must be translucent *before* requesting the Windows backdrop.
   useEffect(() => {
     if (!navigator.userAgent.includes('Windows')) return;
     let mounted = true;
+    const page = document.documentElement;
+    page.classList.add('native-vibrancy');
     const apply = async () => {
       try {
-        await getCurrentWindow().setEffects({ effects: [Effect.Mica, Effect.Acrylic] });
-        if (mounted) document.documentElement.classList.add('native-vibrancy');
-      } catch {
-        if (mounted) document.documentElement.classList.remove('native-vibrancy');
+        await getCurrentWindow().setEffects({
+          effects: [Effect.Acrylic, Effect.Mica],
+          state: EffectState.Active,
+        });
+        if (mounted) setWindowEffectStatus('requested');
+      } catch (err) {
+        // Previously swallowed every error, leaving an unexplained solid UI.
+        console.warn('[Thorn Intelligence] Native Windows backdrop unavailable:', err);
+        if (mounted) {
+          page.classList.remove('native-vibrancy');
+          setWindowEffectError(String(err));
+          setWindowEffectStatus('failed');
+        }
       }
     };
     void apply();
     return () => {
       mounted = false;
-      document.documentElement.classList.remove('native-vibrancy');
+      page.classList.remove('native-vibrancy');
     };
   }, []);
 
@@ -346,7 +360,20 @@ export default function App() {
     <div className="main-shell">
       <header className="topbar">
         <div className="crumb"><button className="menu-button icon-button" aria-label="Abrir menu" onClick={() => setMobileMenu(true)}><Menu size={20}/></button><span>Workspace</span><ChevronRight size={14}/><strong>{links.find((link) => link.id === section)?.label}</strong></div>
-        <div className="top-actions"><span className="local-pill"><span className="live-dot"/> LOCAL-FIRST</span><button className="top-help" onClick={() => selectSection('optimize')} title="Conheça os controles de segurança" aria-label="Segurança"><CircleHelp size={19}/></button><div className="user-avatar"><Disc3 size={17}/></div></div>
+        <div className="top-actions">
+          {navigator.userAgent.includes('Windows') && <span
+            className={'effect-pill ' + (windowEffectStatus === 'failed' ? 'is-unavailable' : '')}
+            role="status"
+            title={windowEffectStatus === 'failed'
+              ? 'Mica/Acrylic não puderam ser solicitados: ' + windowEffectError
+              : windowEffectStatus === 'requested'
+                ? 'Efeito solicitado ao Windows. A aparência final depende dos efeitos de transparência do sistema, WebView2 e DWM.'
+                : 'Inicializando o efeito nativo do Windows.'}>
+            {windowEffectStatus === 'failed' ? 'Vidro indisponível'
+              : windowEffectStatus === 'requested' ? 'Acrylic solicitado'
+              : 'Ativando vidro…'}
+          </span>}
+          <span className="local-pill"><span className="live-dot"/> LOCAL-FIRST</span><button className="top-help" onClick={() => selectSection('optimize')} title="Conheça os controles de segurança" aria-label="Segurança"><CircleHelp size={19}/></button><div className="user-avatar"><Disc3 size={17}/></div></div>
       </header>
       <main id="main-content" className="content">
         <div className="hero-heading">
