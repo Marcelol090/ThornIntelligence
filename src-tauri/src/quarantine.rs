@@ -216,8 +216,10 @@ pub fn quarantine(
         .map_err(|e| format!("Não foi possível criar a quarentena local: {e}"))?;
     let target = quarantine_root.join(&preview_id);
     if target.exists() { return Err("Destino já ocupado; nenhuma movimentação executada.".into()); }
+    #[cfg(windows)]
+    checked_ancestors(&target)?;
 
-    let mut conn = db(app_data)?;
+    let conn = db(app_data)?;
     // Commit an intent BEFORE rename. After a crash, a prepared record with
     // target present is recoverable by the restore/list path.
     conn.execute("INSERT INTO quarantine_entries
@@ -269,6 +271,11 @@ pub fn list(app_data: &Path) -> Result<Vec<QuarantineItem>, String> {
         .collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
     let mut result = Vec::new();
     for id in ids {
+        // Treat the manifest database as untrusted local input: never
+        // join arbitrary SQL strings into filesystem paths.
+        if Uuid::parse_str(&id).map(|value| value.to_string() != id).unwrap_or(true) {
+            continue;
+        }
         // Never display 'prepared' entries that were never moved.
         if app_data.join("quarantine").join(&id).is_file() {
             if let Some(item) = read_item(&conn, &id)? { result.push(item); }
@@ -319,14 +326,16 @@ pub fn restore(id: String, confirmation: String, app_data: &Path)
             }
         }
     }
-    let (size, _modified, identity) = safe_metadata(&source, app_data, true)?;
-    let expected_identity: u128 = conn.query_row(
-        "SELECT identity_hex FROM quarantine_entries WHERE id=?1", params![id],
-        |row| row.get::<_,String>(0)
-    ).map_err(|e| e.to_string())?.parse()
+    let (size, modified, identity) = safe_metadata(&source, app_data, true)?;
+    let (expected_identity, expected_modified): (String, i64) = conn.query_row(
+        "SELECT identity_hex,modified_ns FROM quarantine_entries WHERE id=?1",
+        params![id], |row| Ok((row.get(0)?, row.get(1)?))
+    ).map_err(|e| e.to_string())?;
+    let expected_identity: u128 = expected_identity.parse()
         .map_err(|_| "Identidade inválida no manifesto.")?;
-    if size != item.size_bytes || identity != expected_identity {
-        return Err("Identidade ou tamanho diferente do manifesto: restauração bloqueada.".into());
+    if size != item.size_bytes || identity != expected_identity ||
+        modified != expected_modified {
+        return Err("Identidade, tamanho ou data modificada desde o registro: restauração bloqueada.".into());
     }
     move_same_volume_no_replace(&source, &original)?;
     conn.execute("UPDATE quarantine_entries SET state='restored' WHERE id=?1",
