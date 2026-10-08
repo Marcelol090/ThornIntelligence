@@ -94,11 +94,40 @@ export interface OptimizationResult {
   output: string;
 }
 
-export type Section = 'overview' | 'explorer' | 'duplicates' | 'search' | 'optimize';
+export type Section = 'overview' | 'explorer' | 'duplicates' | 'search' | 'optimize' | 'cleanup';
 
 /** Lightweight IPC progress; no per-file paths or file contents are sent. */
 export interface ScanProgress {
-  phase: 'scanning' | 'hashing' | 'verifying' | 'searching' | 'complete';
+  phase: 'scanning' | 'indexing' | 'hashing' | 'verifying' | 'searching' | 'complete';
   filesScanned: number;
   hashBytesRead: number;
+}
+
+export interface IndexStats {
+  root: string;
+  files: number;
+  added: number;
+  changed: number;
+  unchanged: number;
+  removed: number;
+  skippedDirectories: number;
+  completedAtUnix: number;
+  elapsedMs: number;
+}
+export interface IndexedSearch {
+  report: SearchReport;
+  completedAtUnix: number;
+}
+export interface QuarantinePreview {
+  previewId: string;
+  path: string;
+  sizeBytes: number;
+  warning: string;
+}
+export interface QuarantineItem {
+  id: string;
+  originalPath: string;
+  sizeBytes: number;
+  createdAtUnix: number;
+  status: string;
 }

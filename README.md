@@ -91,3 +91,13 @@ npm run tauri dev
 **Bloqueio conhecido:** o GitHub Actions vinha falhando antes de iniciar os jobs. O código desta melhoria precisa passar por esses comandos em Windows antes de uma homologação. O app não executa exclusão automática ou desfragmentação autônoma.
 
 Fontes: [Tauri 2 Channels](https://docs.rs/tauri/latest/tauri/ipc/struct.Channel.html), [Tauri Calling Frontend](https://v2.tauri.app/develop/calling-frontend/), [AssetHoard: lições de IPC em 120.000 arquivos](https://assethoard.com/blog/when-120000-files-meet-tauri).
+
+## Índice local e quarentena reversível (em desenvolvimento)
+
+A interface oferece a ação **Atualizar índice SQLite** após escolher e analisar uma pasta. O banco em AppLocalData guarda apenas caminhos, tamanhos, atributos e tempos de modificação; a pesquisa pode consultar a última geração em cache. Cada nova atualização percorre o filesystem e compara metadados, mas NÃO recalcula hashes de conteúdos nem depende apenas de mtime para provar duplicação. Transações SQLite WAL impedem a publicação de um índice parcialmente concluído quando há cancelamento.
+
+Uma seção de **Quarentena segura** permite pré-visualizar um arquivo local por vez e, somente após digitar a confirmação literal, transferi-lo sem sobrescrita para o diretório gerenciado pelo aplicativo. A restauração exige outra confirmação literal. A primeira implementação é apenas Windows, somente arquivos locais normais com um link físico, recusando links, pastas do sistema, OneDrive e volumes diferentes do AppLocalData. **Não existe exclusão permanente automática.**
+
+**Quarentena não libera espaço no mesmo volume e não substitui backup.** A API baseada em caminhos conserva riscos residuais se outro processo modifica as pastas simultaneamente. Não utilizar em ambientes hostis até concluir testes nativos específicos.
+
+Antes de disponibilizar produção, é obrigatório executar o build Rust/Windows, testes de recuperação e testes com arquivos sincronizados. Veja [docs/STORAGE_SAFETY.md](docs/STORAGE_SAFETY.md).

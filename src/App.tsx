@@ -5,10 +5,10 @@ import {
   Activity, AlertCircle, ArrowRight, ArrowUpRight,
   BarChart3, Check, CheckCircle2, ChevronRight, CircleHelp, Clipboard,
   Database, Disc3, File, FileSearch, Fingerprint, Folder, FolderOpen,
-  Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu,
+  Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu, ArchiveRestore,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
+import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section, IndexStats, IndexedSearch, QuarantinePreview, QuarantineItem } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -17,6 +17,7 @@ const links: { id: Section; label: string; icon: IconType }[] = [
   { id: 'explorer', label: 'Explorador', icon: FolderOpen },
   { id: 'duplicates', label: 'Duplicados', icon: Layers3 },
   { id: 'search', label: 'Busca inteligente', icon: FileSearch },
+  { id: 'cleanup', label: 'Quarentena segura', icon: ArchiveRestore },
   { id: 'optimize', label: 'Otimização', icon: Gauge },
 ];
 
@@ -90,6 +91,16 @@ export default function App() {
   const [optimizing, setOptimizing] = useState(false);
   const [diskHealth, setDiskHealth] = useState<DiskHealth | null>(null);
   const [healthBusy, setHealthBusy] = useState(false);
+  const [indexBusy, setIndexBusy] = useState(false);
+  const [indexStats, setIndexStats] = useState<IndexStats | null>(null);
+  const [useCachedIndex, setUseCachedIndex] = useState(false);
+  const [cachedAt, setCachedAt] = useState<number | null>(null);
+  const [quarantinePath, setQuarantinePath] = useState('');
+  const [preview, setPreview] = useState<QuarantinePreview | null>(null);
+  const [quarantined, setQuarantined] = useState<QuarantineItem[]>([]);
+  const [moveConfirmation, setMoveConfirmation] = useState('');
+  const [restoreConfirmation, setRestoreConfirmation] = useState('');
+  const [quarantineBusy, setQuarantineBusy] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
 
   async function copy(value: string) {
@@ -98,7 +109,7 @@ export default function App() {
   }
 
   async function scanFolder(root?: string, pattern = regex, min = minMb) {
-    if (activeJob.current || busy || searchBusy) {
+    if (activeJob.current || busy || searchBusy || indexBusy) {
       setError('Já existe uma análise em andamento.');
       return;
     }
@@ -145,7 +156,7 @@ export default function App() {
 
   async function searchMetadata() {
     if (!report) return;
-    if (activeJob.current || busy || searchBusy) {
+    if (activeJob.current || busy || searchBusy || indexBusy) {
       setError('Já existe uma operação em andamento.');
       return;
     }
@@ -170,9 +181,17 @@ export default function App() {
         minSizeBytes: Math.floor(parsed * 1048576),
         maxFiles: 250_000,
       };
-      const result = await invoke<SearchReport>('search_path', { request, jobId, onProgress });
-      setSearchResult(result);
-      setToast('Busca por metadados concluída em ' + duration(result.elapsedMs) + '.');
+      if (useCachedIndex) {
+        const cached = await invoke<IndexedSearch>('search_index', { request });
+        setSearchResult(cached.report);
+        setCachedAt(cached.completedAtUnix);
+        setToast('Busca no índice SQLite concluída; resultados referentes ao último snapshot.');
+      } else {
+        const result = await invoke<SearchReport>('search_path', { request, jobId, onProgress });
+        setSearchResult(result);
+        setCachedAt(null);
+        setToast('Busca por metadados concluída em ' + duration(result.elapsedMs) + '.');
+      }
     } catch (err) {
       const message = String(err);
       if (message.includes('cancelada')) setToast('Pesquisa cancelada; os resultados anteriores foram preservados.');
@@ -196,6 +215,98 @@ export default function App() {
       setError('Não foi possível cancelar a operação: ' + String(err));
       setCancelRequested(false);
     }
+  }
+
+  async function refreshIndex() {
+    if (!report || activeJob.current || busy || searchBusy || indexBusy) return;
+    setError('');
+    const jobId = crypto.randomUUID();
+    const onProgress = new Channel<ScanProgress>();
+    onProgress.onmessage = (event) => {
+      if (activeJob.current === jobId) setScanProgress(event);
+    };
+    activeJob.current = jobId;
+    setScanProgress(null);
+    setCancelRequested(false);
+    setIndexBusy(true);
+    try {
+      const stats = await invoke<IndexStats>('refresh_index', {
+        root: report.root, maxFiles: 250_000, jobId, onProgress,
+      });
+      setIndexStats(stats);
+      setUseCachedIndex(true);
+      setToast('Índice atualizado: ' + number(stats.added) + ' novos, ' +
+        number(stats.changed) + ' alterados, ' + number(stats.unchanged) + ' inalterados.');
+    } catch (err) {
+      const message = String(err);
+      if (message.includes('cancelada')) setToast('Indexação cancelada; último snapshot preservado.');
+      else setError(message);
+    } finally {
+      if (activeJob.current === jobId) activeJob.current = null;
+      setScanProgress(null);
+      setCancelRequested(false);
+      setIndexBusy(false);
+    }
+  }
+
+  async function pickQuarantineFile() {
+    try {
+      const path = await open({ directory: false, multiple: false,
+        title: 'Escolha um arquivo local para pré-visualizar' });
+      if (typeof path === 'string') {
+        setQuarantinePath(path); setPreview(null); setMoveConfirmation('');
+      }
+    } catch (err) { setError(String(err)); }
+  }
+
+  async function loadQuarantine() {
+    try {
+      const entries = await invoke<QuarantineItem[]>('list_quarantine');
+      setQuarantined(entries);
+    } catch (err) { setError('Não foi possível listar a quarentena: ' + String(err)); }
+  }
+
+  async function previewQuarantine() {
+    setError(''); setPreview(null); setMoveConfirmation(''); setQuarantineBusy(true);
+    try {
+      const next = await invoke<QuarantinePreview>('preview_quarantine', { path: quarantinePath });
+      setPreview(next);
+    } catch (err) { setError('Pré-visualização bloqueada: ' + String(err)); }
+    finally { setQuarantineBusy(false); }
+  }
+
+  async function moveToQuarantine() {
+    if (!preview || moveConfirmation !== 'MOVER PARA QUARENTENA') return;
+    setError(''); setQuarantineBusy(true);
+    try {
+      await invoke<QuarantineItem>('quarantine_file', {
+        previewId: preview.previewId, confirmation: moveConfirmation,
+      });
+      setPreview(null); setMoveConfirmation(''); setQuarantinePath('');
+      await loadQuarantine();
+      setToast('Arquivo movido para a quarentena local. Nenhum espaço físico foi liberado.');
+    } catch (err) {
+      setPreview(null); setMoveConfirmation('');
+      setError('Movimentação não confirmada: ' + String(err) +
+        '. Consulte a lista da quarentena antes de tentar novamente.');
+      await loadQuarantine();
+    } finally { setQuarantineBusy(false); }
+  }
+
+  async function restoreQuarantine(id: string) {
+    if (restoreConfirmation !== 'RESTAURAR') return;
+    setError(''); setQuarantineBusy(true);
+    try {
+      await invoke<QuarantineItem>('restore_quarantine', {
+        id, confirmation: restoreConfirmation,
+      });
+      setRestoreConfirmation('');
+      await loadQuarantine();
+      setToast('Arquivo restaurado ao caminho original.');
+    } catch (err) {
+      setError('Restauração bloqueada: ' + String(err));
+      await loadQuarantine();
+    } finally { setQuarantineBusy(false); }
   }
 
   async function checkDiskHealth() {
@@ -236,6 +347,7 @@ export default function App() {
     setSection(value);
     setError('');
     setMobileMenu(false);
+    if (value === 'cleanup') void loadQuarantine();
   }
 
   const scanned = report !== null;
@@ -269,17 +381,18 @@ export default function App() {
       <main id="main-content" className="content">
         <div className="hero-heading">
           <div><div className="hero-kicker"><Sparkles size={14}/> ARMAZENAMENTO SOB CONTROLE</div><h1>{links.find((link) => link.id === section)?.label}<span className="heading-period">.</span></h1><p>Descubra o que ocupa espaço, identifique desperdícios e tome decisões com segurança.</p></div>
-          <button className="primary-button" disabled={busy || searchBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
+          <button className="primary-button" disabled={busy || searchBusy || indexBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
         </div>
 
         <div className="scope-strip glass"><div className="scope-icon"><Folder size={19}/></div><div className="scope-details"><small>ESCOPO ATUAL</small><strong title={roots}>{scopeName}</strong></div><span className="scope-full" title={roots}>{scanned ? truncatePath(roots, 56) : 'Escolha uma pasta ou unidade para iniciar'}</span><Tag tone={scanned ? 'green' : 'neutral'}>{scanned ? 'ANALISADO' : 'AGUARDANDO'}</Tag></div>
 
-        {(busy || searchBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
+        {(busy || searchBusy || indexBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
           <div className="activity-spinner"><LoaderCircle size={20} className="spin"/></div>
           <div className="activity-details">
             <strong>{scanProgress?.phase === 'hashing' ? 'Verificando duplicados com BLAKE3' :
               scanProgress?.phase === 'verifying' ? 'Conferindo identidades físicas' :
-              scanProgress?.phase === 'searching' ? 'Pesquisando metadados' : 'Analisando diretórios'}</strong>
+              scanProgress?.phase === 'searching' ? 'Pesquisando metadados' :
+              scanProgress?.phase === 'indexing' ? 'Atualizando índice SQLite' : 'Analisando diretórios'}</strong>
             <small>{number(scanProgress?.filesScanned ?? 0)} arquivos processados
               {scanProgress && scanProgress.hashBytesRead > 0 ? ' · ' + bytes(scanProgress.hashBytesRead) + ' lidos por hash' : ''}
             </small>
@@ -294,7 +407,7 @@ export default function App() {
         {toast && <div role="status" className="alert toast-alert"><Check size={17}/><span>{toast}</span><button aria-label="Fechar mensagem" className="icon-button" onClick={() => setToast('')}><X size={16}/></button></div>}
         {report && (report.truncated || report.errors > 0 || !report.duplicateAnalysisComplete || report.hardlinkAliases > 0 || report.skippedContentFiles > 0) && <div className="alert warning-alert"><Info size={18}/><span>{report.truncated ? 'Limite de 250.000 arquivos atingido; o relatório é parcial. ' : ''}{report.errors > 0 ? number(report.errors) + ' entradas não puderam ser processadas. ' : ''}{!report.duplicateAnalysisComplete ? 'Análise de duplicados incompleta (limite de leitura, arquivos indisponíveis ou modificados); pode haver mais cópias. ' : ''}{report.hardlinkAliases > 0 ? number(report.hardlinkAliases) + ' links físicos compartilhados foram excluídos das estimativas. ' : ''}{report.skippedContentFiles > 0 ? number(report.skippedContentFiles) + ' arquivos de conteúdo remoto/offline ou reparse foram ignorados no hash para evitar downloads involuntários. ' : ''}As estimativas não equivalem a espaço liberado.</span></div>}
 
-        {!scanned && section !== 'optimize' && <div className="onboarding glass">
+        {!scanned && section !== 'optimize' && section !== 'cleanup' && <div className="onboarding glass">
           <div className="onboarding-content"><Tag tone="blue"><Sparkles size={13}/> INTELLIGENT STORAGE</Tag><h2>Encontre espaço que você nem sabia que tinha.</h2><p>Mapeie arquivos, compare tamanhos, descubra duplicados reais com BLAKE3 e pesquise nomes ou caminhos usando expressões regulares. Tudo acontece no seu computador.</p><button className="primary-button" disabled={busy} onClick={() => void scanFolder()}><FolderOpen size={18}/> Escolher pasta <ArrowRight size={17}/></button></div>
           <div className="onboarding-visual"><div className="orb orb-one"/><div className="orb orb-two"/><div className="preview-card preview-main"><div className="preview-dotline"><i/><i/><i/></div><div className="preview-chart"><div/><div/><div/><div/><div/><div/><div/></div><div className="preview-baseline"/></div><div className="preview-card preview-small"><Fingerprint size={21}/><span>BLAKE3</span><CheckCircle2 size={17}/></div></div>
         </div>}
@@ -338,12 +451,89 @@ export default function App() {
             <form className="search-form" onSubmit={(event: FormEvent) => { event.preventDefault(); void searchMetadata(); }}>
               <label className="field"><span>Expressão regular (nome ou caminho)</span><div className="input-wrap"><Search size={19}/><input type="text" placeholder="Ex.: \\.(iso|zip|mp4)$" value={regex} onChange={(e) => setRegex(e.target.value)} spellCheck={false}/></div></label>
               <label className="field min-field"><span>Tamanho mínimo (MB)</span><div className="input-wrap"><SlidersHorizontal size={18}/><input type="number" min="0" step="1" value={minMb} onChange={(e) => setMinMb(e.target.value)}/></div></label>
-              <button className="primary-button" type="submit" disabled={searchBusy || busy}>{searchBusy ? <LoaderCircle className="spin" size={17}/> : <Search size={17}/>} {searchBusy ? 'Buscando…' : 'Buscar'}</button>
+              <button className="primary-button" type="submit" disabled={searchBusy || busy || indexBusy}>{searchBusy ? <LoaderCircle className="spin" size={17}/> : <Search size={17}/>} {searchBusy ? 'Buscando…' : 'Buscar'}</button>
             </form>
-            <p className="panel-note"><LockKeyhole size={14}/> Busca somente por metadados: não abre conteúdo, não recalcula hashes e preserva o relatório de duplicados. Regex usa a sintaxe do Rust regex.</p>
+            <div className="index-tools">
+              <button type="button" className="outline-button" disabled={indexBusy || busy || searchBusy}
+                onClick={() => void refreshIndex()}>
+                {indexBusy ? <LoaderCircle className="spin" size={16}/> : <Database size={16}/>}
+                {indexBusy ? 'Indexando…' : 'Atualizar índice SQLite'}
+              </button>
+              <label className="index-checkbox"><input type="checkbox"
+                checked={useCachedIndex} onChange={event => setUseCachedIndex(event.target.checked)}/>
+                Pesquisar último snapshot (sem acessar arquivos)
+              </label>
+            </div>
+            {indexStats && <p className="panel-note">Snapshot: {new Date(indexStats.completedAtUnix * 1000).toLocaleString('pt-BR')} ·
+              {number(indexStats.files)} arquivos · {number(indexStats.added)} novos ·
+              {number(indexStats.changed)} alterados · {number(indexStats.removed)} removidos do índice.
+              {indexStats.skippedDirectories > 0 ? ' Diretórios redirecionados excluídos: ' + number(indexStats.skippedDirectories) + '.' : ''}
+            </p>}
+            {cachedAt && <p className="panel-note">Resultados em cache de {new Date(cachedAt * 1000).toLocaleString('pt-BR')};
+              podem estar desatualizados até nova indexação.</p>}
+            <p className="panel-note"><LockKeyhole size={14}/> Busca somente por metadados: não abre conteúdo nem recalcula hashes.
+              O SQLite mantém a última varredura completa; cancelar preserva o snapshot anterior. Regex usa a sintaxe do Rust regex.</p>
           </section>
           {searchResult && (searchResult.truncated || searchResult.errors > 0) && <div className="alert warning-alert"><Info size={18}/><span>Busca parcial: {searchResult.truncated ? 'limite de arquivos atingido. ' : ''}{searchResult.errors > 0 ? number(searchResult.errors) + ' entradas inacessíveis.' : ''}</span></div>}
           <section className="panel glass"><SectionHeading kicker="RESULTADOS DE PESQUISA" title={number(searchResult?.totalMatches ?? report.totalMatches) + ' arquivos encontrados'} description="Exibindo até 500 resultados, em ordem decrescente de tamanho."/><FileRows files={searchResult?.matches ?? report.matches} copy={copy}/></section>
+        </div>}
+
+        {section === 'cleanup' && <div className="stack-gap">
+          <div className="insight-banner glass">
+            <div className="insight-icon"><ShieldCheck size={25}/></div>
+            <div><small>QUARENTENA REVERSÍVEL · WINDOWS</small>
+              <strong>Nenhuma exclusão permanente está disponível.</strong>
+              <p>Escolha um único arquivo local, revise a pré-visualização e digite a confirmação.
+                A movimentação somente funciona no mesmo volume do armazenamento local da aplicação.
+                A quarentena não libera espaço em disco e não substitui backup.</p>
+            </div>
+          </div>
+          <section className="panel glass">
+            <SectionHeading kicker="PRÉ-VISUALIZAÇÃO OBRIGATÓRIA" title="Mover arquivo para quarentena"
+              description="Pastas, OneDrive, arquivos do sistema, hardlinks e links simbólicos são bloqueados pelo backend."/>
+            <div className="search-form">
+              <label className="field"><span>Caminho absoluto do arquivo</span>
+                <input type="text" value={quarantinePath}
+                  onChange={event => { setQuarantinePath(event.target.value); setPreview(null); setMoveConfirmation(''); }}
+                  placeholder="C:\\Users\\...\\arquivo.tmp"/></label>
+              <button type="button" className="outline-button" onClick={() => void pickQuarantineFile()}>Selecionar arquivo</button>
+              <button type="button" className="primary-button" disabled={!quarantinePath || quarantineBusy}
+                onClick={() => void previewQuarantine()}>Pré-visualizar</button>
+            </div>
+            {preview && <div className="quarantine-preview" role="group" aria-label="Pré-visualização da quarentena">
+              <strong title={preview.path}>{preview.path}</strong>
+              <p>{bytes(preview.sizeBytes)} · {preview.warning}</p>
+              <label className="field"><span>Digite MOVER PARA QUARENTENA para confirmar</span>
+                <input type="text" autoComplete="off" value={moveConfirmation}
+                  onChange={event => setMoveConfirmation(event.target.value)} /></label>
+              <button type="button" className="primary-button"
+                disabled={quarantineBusy || moveConfirmation !== 'MOVER PARA QUARENTENA'}
+                onClick={() => void moveToQuarantine()}>Mover para quarentena</button>
+            </div>}
+          </section>
+          <section className="panel glass">
+            <SectionHeading kicker="RESTAURAÇÃO" title="Arquivos em quarentena"
+              description="A restauração nunca substitui arquivos existentes no caminho original."
+              right={<button type="button" className="outline-button"
+                onClick={() => void loadQuarantine()}>Atualizar lista</button>}/>
+            {quarantined.length > 0 && <label className="field">
+              <span>Digite RESTAURAR para habilitar a restauração de um item</span>
+              <input type="text" value={restoreConfirmation} autoComplete="off"
+                onChange={event => setRestoreConfirmation(event.target.value)}/>
+            </label>}
+            {quarantined.map(item => <div className="quarantine-item" key={item.id}>
+              <div><strong title={item.originalPath}>{truncatePath(item.originalPath, 100)}</strong>
+                <small>{bytes(item.sizeBytes)} · {new Date(item.createdAtUnix * 1000).toLocaleString('pt-BR')}</small>
+              </div>
+              <button type="button" className="outline-button"
+                disabled={quarantineBusy || restoreConfirmation !== 'RESTAURAR'}
+                onClick={() => void restoreQuarantine(item.id)}>
+                <ArchiveRestore size={16}/> Restaurar
+              </button>
+            </div>)}
+            {!quarantined.length && <p className="panel-note">Nenhum arquivo recuperável listado neste computador.</p>}
+            <p className="panel-note">Não há purga, retenção automática ou liberação física de espaço nesta versão.</p>
+          </section>
         </div>}
 
         {section === 'optimize' && <div className="stack-gap">

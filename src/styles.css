@@ -239,3 +239,18 @@ small{font-size:12px}
 .activity-details small{font-size:11px;color:#8fa4bd}
 .scan-activity .outline-button{min-height:36px}
 @media(max-width:570px){.scan-activity{flex-wrap:wrap}.scan-activity .outline-button{width:100%}}
+
+/* SQLite snapshot control and reversible quarantine (Windows-only). */
+.index-tools{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:13px 0 8px}
+.index-checkbox{display:flex;align-items:center;gap:8px;color:var(--text-secondary,#9caec1);font-size:12px;cursor:pointer}
+.index-checkbox input{width:16px;height:16px;accent-color:#76b4ff}
+.quarantine-preview{display:grid;gap:13px;margin-top:16px;padding:17px;border:1px solid rgba(121,171,226,.23);border-radius:13px;background:rgba(34,55,82,.27)}
+.quarantine-preview strong{font-size:13px;overflow-wrap:anywhere}
+.quarantine-preview p{font-size:12px;line-height:1.7;color:#b2c4d6}
+.quarantine-preview .primary-button{justify-self:start}
+.quarantine-item{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:13px 4px;border-bottom:1px solid rgba(165,187,210,.12)}
+.quarantine-item>div{display:flex;flex-direction:column;gap:7px;min-width:0}
+.quarantine-item strong{font-size:12px;overflow-wrap:anywhere}
+.quarantine-item small{font-size:11px;color:#9caec1}
+.quarantine-item .outline-button{flex-shrink:0;display:inline-flex;align-items:center;gap:6px}
+@media(max-width:630px){.quarantine-item{align-items:stretch;flex-direction:column}.quarantine-item .outline-button{justify-content:center}}

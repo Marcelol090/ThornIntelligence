@@ -144,3 +144,12 @@ Referências pesquisadas via Exa:
 - Nunca hidratar arquivos em nuvem para preencher índices; deixar digest como `NULL` e apresentar a razão.
 - Single writer, transações por lote e recuperação após cancelamento/crash. Cada snapshot completo deve ser marcado concluído ou incompleto.
 - Quarentena reversível vem depois: manifesto auditável, confirmação explícita, restauração e exclusão permanente isolada.
+
+## Persistência e quarentena (primeira implementação)
+
+- index.rs: SQLite WAL com snapshots atômicos por raiz, identificação de arquivos alterados pelo inventário de metadados, consulta Regex do último snapshot e ROLLBACK em cancelamento/erro. Não reutiliza hashes BLAKE3 por mtime.
+- quarantine.rs: somente Windows, pré-visualização com autorização em memória e TTL 5 min, manifesto de intenção gravado antes do movimento, MoveFileExW de mesmo volume sem flags de cópia/sobrescrita, restauração sem substituir o destino.
+- lib.rs: novas Tauri commands refresh_index, search_index, preview_quarantine, quarantine_file, list_quarantine, restore_quarantine. Comandos modificadores não recebem caminho arbitrário nem podem operar sem confirmação literal.
+- App.tsx: botão Atualizar índice SQLite e alternância busca em cache; seção Quarentena segura com revisão do caminho, frase de confirmação, lista e restauração explícita.
+
+O índice atualizado ainda percorre diretórios inteiros para detectar alterações, sem USN Journal e sem deduplicação incremental por hashes. A quarentena não libera capacidade enquanto arquivos estiverem no mesmo volume. Para escopo e limites de segurança completos: docs/STORAGE_SAFETY.md.
