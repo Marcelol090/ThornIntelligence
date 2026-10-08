@@ -153,3 +153,14 @@ Referências pesquisadas via Exa:
 - App.tsx: botão Atualizar índice SQLite e alternância busca em cache; seção Quarentena segura com revisão do caminho, frase de confirmação, lista e restauração explícita.
 
 O índice atualizado ainda percorre diretórios inteiros para detectar alterações, sem USN Journal e sem deduplicação incremental por hashes. A quarentena não libera capacidade enquanto arquivos estiverem no mesmo volume. Para escopo e limites de segurança completos: docs/STORAGE_SAFETY.md.
+
+
+## Indexed Engine v2 — SQLite WAL em lotes
+
+- O índice provisório usa uma tabela separada (indexed_stage) com transações de até 1.024 arquivos cada; a geração publicada permanece inalterada durante a enumeração.
+- Publicação somente após sucesso completo, por transação atômica que transfere metadados, remove arquivos ausentes e atualiza o marcador de geração.
+- Cancelamento e erros deixam o índice anterior válido; lotes não publicados são descartados quando uma nova tentativa começa. **Isso não é retomada real**: uma nova tentativa reenumera a pasta inteira.
+- A última transação ainda pode gerar WAL proporcional ao tamanho total do índice. Benchmarks com milhões de arquivos devem avaliar tamanho do WAL, tempo de commit, IOPS e RAM.
+- maxFiles é opcional na atualização do índice, sem teto de 250 mil. Limite explícito interrompe sem publicar snapshot incompleto.
+- Quarentena não é modificada. Para validação local: PowerShell 7, scripts/validate-windows.ps1.
+- Fontes Exa: https://sqlite.org/wal.html ; https://sqlite.org/forum/info/7da967e0141c7a1466755f8659f7cb0fea22f75cf6 ; https://docs.rs/rusqlite/latest/rusqlite/ .

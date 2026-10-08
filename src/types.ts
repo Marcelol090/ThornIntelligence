@@ -113,6 +113,7 @@ export interface IndexStats {
   skippedDirectories: number;
   completedAtUnix: number;
   elapsedMs: number;
+  batchesWritten: number;
 }
 export interface IndexedSearch {
   report: SearchReport;

@@ -231,7 +231,7 @@ export default function App() {
     setIndexBusy(true);
     try {
       const stats = await invoke<IndexStats>('refresh_index', {
-        root: report.root, maxFiles: 250_000, jobId, onProgress,
+        root: report.root, jobId, onProgress,
       });
       setIndexStats(stats);
       setUseCachedIndex(true);
@@ -455,6 +455,10 @@ export default function App() {
               <label className="field min-field"><span>Tamanho mínimo (MB)</span><div className="input-wrap"><SlidersHorizontal size={18}/><input type="number" min="0" step="1" value={minMb} onChange={(e) => setMinMb(e.target.value)}/></div></label>
               <button className="primary-button" type="submit" disabled={searchBusy || busy || indexBusy}>{searchBusy ? <LoaderCircle className="spin" size={17}/> : <Search size={17}/>} {searchBusy ? 'Buscando…' : 'Buscar'}</button>
             </form>
+            <p className="panel-note"><Database size={14}/> Indexação sem teto artificial de arquivos.
+              Registros são gravados em lotes de até 1.024; o snapshot anterior continua
+              disponível até a atualização terminar. Cancelar não publica índices parciais.
+              Uma interrupção ainda requer nova enumeração na próxima tentativa.</p>
             <div className="index-tools">
               <button type="button" className="outline-button" disabled={indexBusy || busy || searchBusy}
                 onClick={() => void refreshIndex()}>
@@ -468,7 +472,7 @@ export default function App() {
             </div>
             {indexStats && <p className="panel-note">Snapshot: {new Date(indexStats.completedAtUnix * 1000).toLocaleString('pt-BR')} ·
               {number(indexStats.files)} arquivos · {number(indexStats.added)} novos ·
-              {number(indexStats.changed)} alterados · {number(indexStats.removed)} removidos do índice.
+              {number(indexStats.changed)} alterados · {number(indexStats.removed)} removidos do índice · {number(indexStats.batchesWritten)} lotes SQLite gravados.
               {indexStats.skippedDirectories > 0 ? ' Diretórios redirecionados excluídos: ' + number(indexStats.skippedDirectories) + '.' : ''}
             </p>}
             {cachedAt && <p className="panel-note">Resultados em cache de {new Date(cachedAt * 1000).toLocaleString('pt-BR')};

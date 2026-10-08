@@ -101,3 +101,8 @@ Uma seção de **Quarentena segura** permite pré-visualizar um arquivo local po
 **Quarentena não libera espaço no mesmo volume e não substitui backup.** A API baseada em caminhos conserva riscos residuais se outro processo modifica as pastas simultaneamente. Não utilizar em ambientes hostis até concluir testes nativos específicos.
 
 Antes de disponibilizar produção, é obrigatório executar o build Rust/Windows, testes de recuperação e testes com arquivos sincronizados. Veja [docs/STORAGE_SAFETY.md](docs/STORAGE_SAFETY.md).
+
+
+### Indexação de metadados em lotes
+
+O comando Atualizar índice SQLite agora permite todas as entradas acessíveis sem limite numérico automático, e informa quantos lotes de até 1.024 linhas foram gravados. O índice publicado só muda ao completar toda a enumeração; cancelamento descarta a nova geração. Ainda não há retomada real após crash, e o estágio provisório consome espaço adicional. Use pwsh -File scripts/validate-windows.ps1 em Windows para verificar frontend e Rust. A varredura principal somente perde o antigo teto de 250 mil quando as mudanças independentes do PR #11 forem integradas.
