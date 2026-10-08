@@ -128,6 +128,7 @@ export default function App() {
   const [indexedScopes, setIndexedScopes] = useState<IndexedScope[]>([]);
   const [selectedIndexedRoot, setSelectedIndexedRoot] = useState('');
   const [indexedScopesLoading, setIndexedScopesLoading] = useState(false);
+  const [treeRevision, setTreeRevision] = useState(0);
   const [useCachedIndex, setUseCachedIndex] = useState(false);
   const [cachedAt, setCachedAt] = useState<number | null>(null);
   const [quarantinePath, setQuarantinePath] = useState('');
@@ -437,6 +438,8 @@ export default function App() {
       });
       setIndexStats(stats);
       setSelectedIndexedRoot(stats.root);
+      // completedAtUnix has only second resolution; use an explicit nonce.
+      setTreeRevision(current => current + 1);
       await loadIndexedScopes();
       setUseCachedIndex(true);
       setToast('Índice atualizado: ' + number(stats.added) + ' novos, ' +
@@ -713,8 +716,7 @@ export default function App() {
           </div>
           {(selectedIndexedRoot || report?.root) ?
             <IndexedTree root={selectedIndexedRoot || report?.root || ''}
-              revision={indexStats?.root === (selectedIndexedRoot || report?.root)
-                ? indexStats.completedAtUnix : 0}
+              revision={treeRevision}
               refreshing={indexBusy}
               onRefresh={() => void refreshIndex(selectedIndexedRoot || report?.root)}
               onCopy={(path) => void copy(path)}/>
