@@ -525,7 +525,10 @@ pub fn scan_with_control(
     let mut hashed_bytes = 0_u64;
     // Directory reparse exclusions make the duplicate inventory deliberately partial.
     let mut skipped_content_files = skipped_reparse_directories;
-    let mut duplicate_analysis_complete = skipped_reparse_directories == 0;
+    // A fully hashed *subset* is not a complete scan if traversal skipped
+    // any inaccessible entry, reparse directory, or an explicitly capped tail.
+    let mut duplicate_analysis_complete =
+        skipped_reparse_directories == 0 && errors == 0 && !truncated;
     let mut groups = HashMap::<(u64, String), Vec<String>>::new();
 
     // Stage 1: sample only 16 KiB per candidate, grouped by size.
@@ -824,6 +827,22 @@ mod tests {
         }).unwrap();
         assert_eq!(report.files_scanned, 3);
         assert!(report.truncated);
+    }
+
+    #[test]
+    fn explicit_sample_never_claims_complete_duplicate_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..4 {
+            fs::write(dir.path().join(format!("copy_{i}")), b"same").unwrap();
+        }
+        let report = scan(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: Some(2),
+            analyze_duplicates: Some(true),
+        }).unwrap();
+        assert_eq!(report.files_scanned, 2);
+        assert!(report.truncated);
+        assert!(!report.duplicate_analysis_complete);
     }
 
     #[test]
