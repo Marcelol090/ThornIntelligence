@@ -1,5 +1,6 @@
 use crate::scan::{FileResult, ScanProgress};
 use crate::search::{SearchReport, SearchRequest};
+use crate::reparse::{self, ReparseKind};
 use regex::RegexBuilder;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -54,10 +55,6 @@ fn attributes(metadata: &std::fs::Metadata) -> u32 {
 #[cfg(not(windows))]
 fn attributes(_: &std::fs::Metadata) -> u32 { 0 }
 
-fn is_reparse(metadata: &std::fs::Metadata) -> bool {
-    metadata.file_type().is_symlink() || (attributes(metadata) & 0x400 != 0)
-}
-
 pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(db_err)?;
@@ -100,11 +97,17 @@ pub fn refresh(
     mut progress: impl FnMut(ScanProgress),
 ) -> Result<IndexStats, String> {
     let timer = Instant::now();
+    let selected = Path::new(requested_root);
+    let selected_meta = std::fs::symlink_metadata(selected).map_err(db_err)?;
+    if reparse::classify(selected, &selected_meta)? == ReparseKind::RedirectedOrUnknown {
+        return Err("Raiz redirecionada ou reparse desconhecido: indexação recusada.".into());
+    }
     let root = std::fs::canonicalize(requested_root)
         .map_err(|e| format!("Pasta não encontrada: {e}"))?;
     if !root.is_dir() { return Err("Selecione uma pasta.".into()); }
-    if is_reparse(&std::fs::symlink_metadata(&root).map_err(db_err)?) {
-        return Err("Raiz redirecionada/reparse não pode ser indexada.".into());
+    if reparse::classify(&root, &std::fs::symlink_metadata(&root).map_err(db_err)?)?
+        == ReparseKind::RedirectedOrUnknown {
+        return Err("Raiz redirecionada ou reparse desconhecido: indexação recusada.".into());
     }
     let root_str = root.to_string_lossy().into_owned();
     let mut conn = connection(db_path)?;
@@ -146,7 +149,7 @@ pub fn refresh(
         if entry.path() == root { continue; }
         let metadata = std::fs::symlink_metadata(entry.path())
             .map_err(|e| format!("Índice não publicado: metadados indisponíveis: {e}"))?;
-        if is_reparse(&metadata) {
+        if reparse::classify(entry.path(), &metadata)? == ReparseKind::RedirectedOrUnknown {
             if entry.file_type().is_dir() { walker.skip_current_dir(); }
             skipped_directories += usize::from(entry.file_type().is_dir());
             continue;
@@ -300,6 +303,29 @@ mod tests {
         }).unwrap();
         assert_eq!(found.report.total_matches, 1);
         assert_eq!(found.report.matches[0].name, "a.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_redirected_roots_and_ignores_external_links() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("scope");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(root.join("local.txt"), "local").unwrap();
+        fs::write(outside.join("external.txt"), "external").unwrap();
+        symlink(&outside, root.join("redirect")).unwrap();
+        let db = dir.path().join("index.db");
+        let token = AtomicBool::new(false);
+        let stats = refresh(&db, root.to_str().unwrap(), 100, &token, |_| {}).unwrap();
+        assert_eq!(stats.files, 1);
+        symlink(&root, dir.path().join("root-alias")).unwrap();
+        assert!(refresh(
+            &db, dir.path().join("root-alias").to_str().unwrap(),
+            100, &token, |_| {}
+        ).is_err());
     }
 
     #[test]

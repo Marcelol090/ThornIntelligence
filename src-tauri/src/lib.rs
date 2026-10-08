@@ -2,6 +2,7 @@ mod health;
 mod jobs;
 mod index;
 mod quarantine;
+mod reparse;
 mod optimize;
 mod scan;
 mod search;
