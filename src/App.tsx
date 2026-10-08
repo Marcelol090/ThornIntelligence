@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import type { IndexStats, IndexedSearch, QuarantinePreview, QuarantineItem, CompareReport, CompareRequest, AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
+import { IndexedTree } from './components/IndexedTree';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
 const links: { id: Section; label: string; icon: IconType }[] = [
@@ -657,6 +658,12 @@ export default function App() {
           </div>
           <section className="panel glass wide-panel"><SectionHeading kicker="OPORTUNIDADES" title="Arquivos que mais ocupam espaço" right={<button className="text-button" onClick={() => selectSection('explorer')}>Explorar arquivos <ArrowRight size={16}/></button>}/><FileRows files={report.topFiles.slice(0, 7)} copy={copy}/></section>
         </>}
+
+        {section === 'explorer' && report && <section className="panel glass full-panel">
+          <IndexedTree root={report.root} revision={indexStats?.completedAtUnix ?? 0}
+            refreshing={indexBusy} onRefresh={() => void refreshIndex()}
+            onCopy={(path) => void copy(path)}/>
+        </section>}
 
         {section === 'explorer' && report && <section className="panel glass full-panel">
           <SectionHeading kicker="RANKING POR TAMANHO" title="Arquivos grandes"

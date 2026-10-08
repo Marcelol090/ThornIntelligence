@@ -211,3 +211,21 @@ O comando Atualizar índice SQLite agora permite todas as entradas acessíveis s
 ### Pausar e retomar a indexação sem perder a operação ativa
 
 Durante Atualizar índice SQLite, use **Pausar** para interromper a enumeração entre entradas; o contador permanece visível e a tarefa conserva a sessão ativa. Use **Retomar** para continuar a partir do mesmo iterador, sem começar novamente, enquanto o aplicativo continuar aberto. **Cancelar** também funciona durante a pausa: o token de cancelamento acorda o indexador e impede publicar dados incompletos. Só a geração final, totalmente varrida, aparece nas pesquisas. O sistema consulta o token a cada entrada, com atraso de até aproximadamente 50 ms entre verificações (chamadas de disco bloqueadas podem demorar mais). Não é um recurso de retomada após desligamento/reinício: os metadados podem mudar enquanto a máquina está offline e o índice será reenumerado em uma nova tentativa. Consulte docs/ARCHITECTURE.md.
+
+## Navegação hierárquica sob demanda — SQLite e React (08/10/2026)
+
+A tela **Explorador → Árvore indexada por diretório** complementa o antigo ranking dos 300 maiores arquivos. A árvore contém todos os arquivos do snapshot SQLite completo, mas carrega somente os filhos da pasta aberta: 100 por página, 200 como limite absoluto da API. Os resultados usam **paginação keyset** (tipo, tamanho e caminho), pastas antes dos arquivos e ordenação estável por tamanho, com cursor vinculado à geração publicada. Em vez de montar todos os nós React, o componente renderiza apenas as linhas da janela visível.
+
+### Backend e migração
+
+- A indexação acrescenta o caminho pai às tabelas SQLite de arquivos e staging, com migração idempotente para instalações antigas; cria índice composto por raiz, pai, geração, tamanho e caminho para permitir consultas de filhos.
+- A nova tabela de diretórios armazena tamanho lógico acumulado e número de arquivos, inclusive pastas vazias. A memória usada para agregar tamanhos cresce com a quantidade de diretórios, não com todos os arquivos. **A árvore e o inventário são publicados na mesma transação**: cancelamento ou erro antes do commit preserva a geração anterior.
+- O comando Tauri browse_index_tree consulta apenas o SQLite, com snapshot consistente, valida raiz/pasta/cursores e impõe limite de paginação. Ele não faz varredura do filesystem, não abre arquivos, não calcula BLAKE3 e não hidrata arquivos remotos. O índice continua excluindo entradas reparse/junction que não podem ser enumeradas com segurança.
+- Índices gravados por versões anteriores devem ser **atualizados uma vez** para materializar a árvore. O usuário pode fazer isso pelo novo botão Atualizar índice no Explorador.
+- Corrigido adicionalmente o retorno de pesquisa SQLite para preencher contentStatus, exigido por FileResult na UI. Estatísticas de diretórios são **lógicas**, não comprovam economia física nem descontam hardlinks.
+
+### Testes / limites
+
+Foram adicionados testes Rust para pastas vazias, agregação de tamanhos, paginação estável em páginas de um item, diretórios fora da raiz, cursores inválidos, cancelamento mantendo o snapshot anterior e invalidação de cursor após nova geração. **A compilação Rust e os ensaios NVMe ainda não foram realizados** devido ao bloqueio anterior dos runners Windows. Medir latência por clique, IOPS, tamanho do WAL e RAM antes/depois com >250 mil arquivos; validar OneDrive, Unicode, diretórios profundos, muitos filhos e grandes snapshots.
+
+Referências pesquisadas com Exa/GitHub: https://github.com/0xf0f/sqlite-file-index ; https://github.com/jpgneves/minidex ; https://github.com/TanStack/virtual ; https://github.com/jameskerr/react-arborist ; https://github.com/Swatto86/AllTheThings ; https://github.com/Ryan-Sayer/strata . Os algoritmos MFT/USN são uma prioridade posterior, pois exigem acesso NTFS apropriado e fallback.

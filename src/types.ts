@@ -179,6 +179,36 @@ export interface IndexedSearch {
   report: SearchReport;
   completedAtUnix: number;
 }
+
+/** One keyset page from the last published SQLite directory snapshot. */
+export interface TreeCursor {
+  kind: 'directory' | 'file';
+  sizeBytes: number;
+  path: string;
+}
+export interface TreeRequest {
+  root: string;
+  parentPath: string;
+  after?: TreeCursor | null;
+  limit?: number;
+  generation?: number | null;
+}
+export interface TreeNode {
+  path: string;
+  name: string;
+  kind: 'directory' | 'file';
+  sizeBytes: number;
+  files: number;
+  contentStatus: 'local' | 'offline' | 'reparse';
+}
+export interface TreePage {
+  root: string;
+  parentPath: string;
+  nodes: TreeNode[];
+  nextCursor: TreeCursor | null;
+  completedAtUnix: number;
+  generation: number;
+}
 export interface QuarantinePreview {
   previewId: string;
   path: string;

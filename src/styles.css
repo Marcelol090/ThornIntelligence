@@ -344,3 +344,36 @@ html.native-vibrancy .glass-inset{
 .quarantine-item small{font-size:11px;color:#9caec1}
 .quarantine-item .outline-button{flex-shrink:0;display:inline-flex;align-items:center;gap:6px}
 @media(max-width:630px){.quarantine-item{align-items:stretch;flex-direction:column}.quarantine-item .outline-button{justify-content:center}}
+
+
+/* SQLite-backed, paginated directory tree. Only viewport rows are mounted. */
+.indexed-tree {min-width:0;display:grid;gap:12px}
+.indexed-tree-header{display:flex;justify-content:space-between;align-items:center;
+ gap:16px;flex-wrap:wrap}
+.indexed-tree-header>div{display:grid;gap:5px;min-width:0}
+.indexed-tree-header strong{color:#e3edfc;font-size:13px}
+.indexed-tree-header small{color:#9caec1;font-size:11px;overflow-wrap:anywhere}
+.indexed-tree-window{height:460px;max-width:100%;overflow:auto;overscroll-behavior:contain;
+ background:rgba(9,21,40,.26);border:1px solid rgba(141,178,221,.2);
+ border-radius:13px;scrollbar-gutter:stable}
+.indexed-tree-window:focus-visible{outline:2px solid #92caff;outline-offset:3px}
+.indexed-tree-space{position:relative;min-width:0;width:100%}
+.indexed-tree-row{position:absolute;left:0;right:0;display:flex;align-items:center;
+ justify-content:space-between;gap:10px;padding-right:18px;background:transparent;
+ border:0;border-bottom:1px solid rgba(147,177,209,.075);color:#d9e6f8;
+ cursor:pointer;text-align:left;min-width:0;width:100%;font:inherit;font-size:12px}
+.indexed-tree-row:hover{background:rgba(95,143,206,.16)}
+.indexed-tree-row:focus-visible{outline:2px solid #8fc9ff;outline-offset:-3px;z-index:2}
+.indexed-tree-row:disabled{cursor:default;opacity:.6}
+.indexed-tree-row.is-placeholder{color:#9ebad1;font-size:11px}
+.indexed-tree-row.is-folder .indexed-tree-identity>svg:nth-child(2){color:#8ebafa}
+.indexed-tree-identity{display:flex;align-items:center;gap:8px;min-width:0;flex:1}
+.indexed-tree-identity>svg{flex-shrink:0}
+.indexed-tree-identity small{font-size:10px;color:#e6ba7d}
+.indexed-tree-chevron{width:14px;flex-shrink:0}
+.indexed-tree-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.indexed-tree-size{flex-shrink:0;display:flex;gap:3px;flex-direction:column;
+ text-align:right;white-space:nowrap;color:#b3d9f9;font-variant-numeric:tabular-nums}
+.indexed-tree-size small{color:#8ea6bf;font-size:10px}
+@media(max-width:660px){.indexed-tree-row{padding-right:8px;font-size:11px}
+ .indexed-tree-size small{display:none}}
