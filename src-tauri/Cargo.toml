@@ -21,6 +21,8 @@ regex = "1"
 walkdir = "2"
 blake3 = "1"
 same-file = "1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

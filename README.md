@@ -190,3 +190,24 @@ A implementação inclui testes para múltiplas cópias, arquivos com conteúdo 
 Referências: [same-file Handle](https://docs.rs/same-file/latest/same_file/struct.Handle.html), [atributos de arquivos no Windows](https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants), [dupeGuru — hardlinks entre sistemas de arquivos](https://github.com/arsenetar/dupeguru/issues/1388).
 
 **Validação de release:** `npm run build`, `cargo test --manifest-path src-tauri/Cargo.toml`, `cargo check --manifest-path src-tauri/Cargo.toml`; repetir em NTFS local, OneDrive Files On-Demand e volumes diferentes com arquivos de teste. Os jobs GitHub Actions precisam iniciar antes de afirmar que o aplicativo foi homologado.
+
+
+## Índice local e quarentena reversível (em desenvolvimento)
+
+A interface oferece a ação **Atualizar índice SQLite** após escolher e analisar uma pasta. O banco em AppLocalData guarda apenas caminhos, tamanhos, atributos e tempos de modificação; a pesquisa pode consultar a última geração em cache. Cada nova atualização percorre o filesystem e compara metadados, mas NÃO recalcula hashes de conteúdos nem depende apenas de mtime para provar duplicação. Transações SQLite WAL impedem a publicação de um índice parcialmente concluído quando há cancelamento.
+
+Uma seção de **Quarentena segura** permite pré-visualizar um arquivo local por vez e, somente após digitar a confirmação literal, transferi-lo sem sobrescrita para o diretório gerenciado pelo aplicativo. A restauração exige outra confirmação literal. A primeira implementação é apenas Windows, somente arquivos locais normais com um link físico, recusando links, pastas do sistema, OneDrive e volumes diferentes do AppLocalData. **Não existe exclusão permanente automática.**
+
+**Quarentena não libera espaço no mesmo volume e não substitui backup.** A API baseada em caminhos conserva riscos residuais se outro processo modifica as pastas simultaneamente. Não utilizar em ambientes hostis até concluir testes nativos específicos.
+
+Antes de disponibilizar produção, é obrigatório executar o build Rust/Windows, testes de recuperação e testes com arquivos sincronizados. Veja [docs/STORAGE_SAFETY.md](docs/STORAGE_SAFETY.md).
+
+
+### Indexação de metadados em lotes
+
+O comando Atualizar índice SQLite agora permite todas as entradas acessíveis sem limite numérico automático, e informa quantos lotes de até 1.024 linhas foram gravados. O índice publicado só muda ao completar toda a enumeração; cancelamento descarta a nova geração. Ainda não há retomada real após crash, e o estágio provisório consome espaço adicional. Use pwsh -File scripts/validate-windows.ps1 em Windows para verificar frontend e Rust. A varredura principal sem teto artificial já foi integrada pelo PR #11.
+
+
+### Pausar e retomar a indexação sem perder a operação ativa
+
+Durante Atualizar índice SQLite, use **Pausar** para interromper a enumeração entre entradas; o contador permanece visível e a tarefa conserva a sessão ativa. Use **Retomar** para continuar a partir do mesmo iterador, sem começar novamente, enquanto o aplicativo continuar aberto. **Cancelar** também funciona durante a pausa: o token de cancelamento acorda o indexador e impede publicar dados incompletos. Só a geração final, totalmente varrida, aparece nas pesquisas. O sistema consulta o token a cada entrada, com atraso de até aproximadamente 50 ms entre verificações (chamadas de disco bloqueadas podem demorar mais). Não é um recurso de retomada após desligamento/reinício: os metadados podem mudar enquanto a máquina está offline e o índice será reenumerado em uma nova tentativa. Consulte docs/ARCHITECTURE.md.

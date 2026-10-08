@@ -1,6 +1,8 @@
 mod allocation;
 mod compare;
 mod health;
+mod index;
+mod quarantine;
 mod jobs;
 mod optimize;
 mod scan;
@@ -9,12 +11,14 @@ mod search;
 use allocation::{AllocationReport, AllocationRequest};
 use compare::{CompareReport, CompareRequest};
 use health::DiskHealth;
+use index::{IndexStats, IndexedSearch};
+use quarantine::{QuarantineGate, QuarantineItem, QuarantinePreview};
 use jobs::ScanJobs;
 use optimize::OptimizationResult;
 use scan::{ScanProgress, ScanReport, ScanRequest};
 use search::{SearchReport, SearchRequest};
 use std::sync::Arc;
-use tauri::{ipc::Channel, State};
+use tauri::{ipc::Channel, AppHandle, Manager, State};
 
 #[tauri::command]
 async fn scan_path(
@@ -106,6 +110,88 @@ fn cancel_scan(job_id: String, jobs: State<'_, Arc<ScanJobs>>) -> Result<bool, S
 }
 
 #[tauri::command]
+fn pause_index(job_id: String, jobs: State<'_, Arc<ScanJobs>>) -> Result<bool, String> {
+    jobs.set_index_paused(&job_id, true)
+}
+
+#[tauri::command]
+fn resume_index(job_id: String, jobs: State<'_, Arc<ScanJobs>>) -> Result<bool, String> {
+    jobs.set_index_paused(&job_id, false)
+}
+
+#[tauri::command]
+async fn refresh_index(
+    root: String,
+    max_files: Option<usize>,
+    job_id: String,
+    on_progress: Channel<ScanProgress>,
+    app: AppHandle,
+    jobs: State<'_, Arc<ScanJobs>>,
+) -> Result<IndexStats, String> {
+    let app_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let jobs = Arc::clone(jobs.inner());
+    let (token, paused) = jobs.start_index(job_id.clone())?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        index::refresh(
+            &app_data.join("storage-index.sqlite"), &root, max_files,
+            token.as_ref(), paused.as_ref(),
+            |event| { let _ = on_progress.send(event); }
+        )
+    }).await.map_err(|e| e.to_string()).and_then(|result| result);
+    jobs.finish(&job_id);
+    result
+}
+
+#[tauri::command]
+async fn search_index(request: SearchRequest, app: AppHandle)
+    -> Result<IndexedSearch, String> {
+    let app_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        index::search_index(&app_data.join("storage-index.sqlite"), request)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn preview_quarantine(
+    path: String, app: AppHandle, gate: State<'_, Arc<QuarantineGate>>,
+) -> Result<QuarantinePreview, String> {
+    let app_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let gate = Arc::clone(gate.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        quarantine::preview(path, &app_data, &gate)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn quarantine_file(
+    preview_id: String, confirmation: String, app: AppHandle,
+    gate: State<'_, Arc<QuarantineGate>>,
+) -> Result<QuarantineItem, String> {
+    let app_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let gate = Arc::clone(gate.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        quarantine::quarantine(preview_id, confirmation, &app_data, &gate)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn list_quarantine(app: AppHandle) -> Result<Vec<QuarantineItem>, String> {
+    let app_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || quarantine::list(&app_data))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn restore_quarantine(
+    id: String, confirmation: String, app: AppHandle,
+) -> Result<QuarantineItem, String> {
+    let app_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        quarantine::restore(id, confirmation, &app_data)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn optimize_volume(
     drive: String,
     execute: bool,
@@ -130,7 +216,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(optimize::OptimizationGate::default()))
         .manage(Arc::new(ScanJobs::default()))
-        .invoke_handler(tauri::generate_handler![scan_path, search_path, compare_folders, measure_allocated_sizes, cancel_scan, optimize_volume, disk_health])
+        .manage(Arc::new(QuarantineGate::default()))
+        .invoke_handler(tauri::generate_handler![scan_path, search_path, compare_folders, measure_allocated_sizes, cancel_scan,
+            pause_index, resume_index, refresh_index, search_index,
+            preview_quarantine, quarantine_file, list_quarantine, restore_quarantine,
+            optimize_volume, disk_health])
         .run(tauri::generate_context!())
         .expect("error while running Thorn Intelligence");
 }
