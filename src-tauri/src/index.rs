@@ -132,6 +132,34 @@ pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Pause within a running index task, without publishing an incomplete scope.
+/// We cannot safely resume a filesystem walker after the app exits until we
+/// can verify missed changes using a volume journal (USN where supported).
+fn wait_indexer(
+    paused: &AtomicBool,
+    cancel: &AtomicBool,
+    files: usize,
+    progress: &mut impl FnMut(ScanProgress),
+) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Indexação cancelada; snapshot anterior preservado.".into());
+    }
+    if paused.load(Ordering::Relaxed) {
+        progress(ScanProgress { phase: "paused".into(), files_scanned: files, hash_bytes_read: 0 });
+        while paused.load(Ordering::Relaxed) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Indexação cancelada; snapshot anterior preservado.".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Indexação cancelada; snapshot anterior preservado.".into());
+        }
+        progress(ScanProgress { phase: "indexing".into(), files_scanned: files, hash_bytes_read: 0 });
+    }
+    Ok(())
+}
+
 /// Incrementally inventory metadata into bounded, durable SQLite WAL batches.
 /// Readers continue to see the previous completed snapshot throughout traversal.
 /// A separate, atomic publication transaction updates live rows only after every
@@ -143,6 +171,7 @@ pub fn refresh(
     requested_root: &str,
     max_files: Option<usize>,
     cancel: &AtomicBool,
+    paused: &AtomicBool,
     mut progress: impl FnMut(ScanProgress),
 ) -> Result<IndexStats, String> {
     let timer = Instant::now();
@@ -181,10 +210,10 @@ pub fn refresh(
     progress(ScanProgress { phase: "indexing".into(), files_scanned: 0, hash_bytes_read: 0 });
 
     let mut walker = WalkDir::new(&root).follow_links(false).into_iter();
-    while let Some(entry) = walker.next() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("Indexação cancelada; snapshot anterior preservado.".into());
-        }
+    loop {
+        wait_indexer(paused, cancel, files, &mut progress)?;
+        let Some(entry) = walker.next() else { break };
+        wait_indexer(paused, cancel, files, &mut progress)?;
         let entry = entry.map_err(|e| format!("Índice não publicado: entrada inacessível: {e}"))?;
         if entry.path() == root { continue; }
         let metadata = std::fs::symlink_metadata(entry.path())
@@ -239,9 +268,7 @@ pub fn refresh(
             last_event = Instant::now();
         }
     }
-    if cancel.load(Ordering::Relaxed) {
-        return Err("Indexação cancelada; snapshot anterior preservado.".into());
-    }
+    wait_indexer(paused, cancel, files, &mut progress)?;
     if !batch.is_empty() {
         flush_stage(&mut conn, &root_str, &mut batch)?;
         batches_written += 1;
@@ -253,6 +280,7 @@ pub fn refresh(
     // Publication still requires one atomic SQL transaction. For multi-million
     // files this final merge can produce substantial WAL I/O; it does not hold
     // a write transaction during the preceding, potentially hours-long walk.
+    wait_indexer(paused, cancel, files, &mut progress)?;
     let tx = conn.transaction().map_err(db_err)?;
     tx.execute(
         "INSERT INTO indexed_files(root,path,size_bytes,modified_ns,attributes,generation)
@@ -365,13 +393,13 @@ mod tests {
         fs::write(root.join("a.txt"), "aa").unwrap();
         fs::write(root.join("b.txt"), "bbb").unwrap();
         let c = AtomicBool::new(false);
-        let first = refresh(&db, root.to_str().unwrap(), None, &c, |_| {}).unwrap();
+        let first = refresh(&db, root.to_str().unwrap(), None, &c, &AtomicBool::new(false), |_| {}).unwrap();
         assert_eq!((first.added,first.changed,first.unchanged), (2,0,0));
-        let second = refresh(&db, root.to_str().unwrap(), None, &c, |_| {}).unwrap();
+        let second = refresh(&db, root.to_str().unwrap(), None, &c, &AtomicBool::new(false), |_| {}).unwrap();
         assert_eq!((second.added,second.changed,second.unchanged), (0,0,2));
         fs::write(root.join("a.txt"), "longer payload").unwrap();
         fs::remove_file(root.join("b.txt")).unwrap();
-        let third = refresh(&db, root.to_str().unwrap(), None, &c, |_| {}).unwrap();
+        let third = refresh(&db, root.to_str().unwrap(), None, &c, &AtomicBool::new(false), |_| {}).unwrap();
         assert_eq!((third.added,third.changed,third.removed), (0,1,1));
         let found = search_index(&db, SearchRequest {
             root: root.to_string_lossy().to_string(),
@@ -391,7 +419,7 @@ mod tests {
             fs::write(root.join(format!("{i:04}.txt")), b"content").unwrap();
         }
         let stats = refresh(&db, root.to_str().unwrap(), None,
-            &AtomicBool::new(false), |_| {}).unwrap();
+            &AtomicBool::new(false), &AtomicBool::new(false), |_| {}).unwrap();
         assert_eq!(stats.files, 1035);
         assert_eq!(stats.added, 1035);
         assert_eq!(stats.batches_written, 2);
@@ -410,11 +438,11 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("original"), b"keep").unwrap();
         let cancel = AtomicBool::new(false);
-        refresh(&db, root.to_str().unwrap(), None, &cancel, |_| {}).unwrap();
+        refresh(&db, root.to_str().unwrap(), None, &cancel, &AtomicBool::new(false), |_| {}).unwrap();
         for i in 0..1050 {
             fs::write(root.join(format!("new-{i:04}")), b"x").unwrap();
         }
-        let result = refresh(&db, root.to_str().unwrap(), None, &cancel, |progress| {
+        let result = refresh(&db, root.to_str().unwrap(), None, &cancel, &AtomicBool::new(false), |progress| {
             if progress.files_scanned >= 1024 {
                 cancel.store(true, Ordering::Relaxed);
             }
@@ -428,8 +456,65 @@ mod tests {
         // Restart performs a complete re-enumeration; staged data isn't
         // mistaken for a valid filesystem snapshot.
         cancel.store(false, Ordering::Relaxed);
-        let done = refresh(&db, root.to_str().unwrap(), None, &cancel, |_| {}).unwrap();
+        let done = refresh(&db, root.to_str().unwrap(), None, &cancel, &AtomicBool::new(false), |_| {}).unwrap();
         assert_eq!(done.files, 1051);
+    }
+
+    #[test]
+    fn pause_then_resume_reaches_a_complete_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        for i in 0..1030 {
+            fs::write(root.join(format!("item-{i:04}")), "x").unwrap();
+        }
+        let paused = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        let mut observed_pause = false;
+        let report = refresh(&dir.path().join("idx.sqlite"), root.to_str().unwrap(),
+            None, &cancel, &paused, |event| {
+                if event.phase == "indexing" && event.files_scanned == INDEX_BATCH_SIZE
+                    && !observed_pause {
+                    paused.store(true, Ordering::Relaxed);
+                }
+                if event.phase == "paused" {
+                    observed_pause = true;
+                    paused.store(false, Ordering::Relaxed);
+                }
+            }).unwrap();
+        assert!(observed_pause);
+        assert_eq!(report.files, 1030);
+        assert_eq!(report.batches_written, 2);
+    }
+
+    #[test]
+    fn cancel_while_paused_preserves_previous_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("original"), "keep").unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let paused = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        refresh(&db, root.to_str().unwrap(), None, &cancel, &paused, |_| {}).unwrap();
+        for i in 0..1040 { fs::write(root.join(format!("new-{i:04}")), "x").unwrap(); }
+        let mut observed_pause = false;
+        let result = refresh(&db, root.to_str().unwrap(), None, &cancel, &paused, |event| {
+            if event.phase == "indexing" && event.files_scanned == INDEX_BATCH_SIZE {
+                paused.store(true, Ordering::Relaxed);
+            }
+            if event.phase == "paused" {
+                observed_pause = true;
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        assert!(observed_pause);
+        assert!(result.unwrap_err().contains("cancelada"));
+        let prior = search_index(&db, SearchRequest {
+            root: root.display().to_string(), regex: None, min_size_bytes: None,
+            max_files: None,
+        }).unwrap();
+        assert_eq!(prior.report.total_matches, 1);
     }
 
     #[test]
@@ -440,7 +525,7 @@ mod tests {
         fs::write(root.join("a"), "1").unwrap();
         fs::write(root.join("b"), "2").unwrap();
         assert!(refresh(&dir.path().join("idx.sqlite"), root.to_str().unwrap(),
-            Some(1), &AtomicBool::new(false), |_| {}).is_err());
+            Some(1), &AtomicBool::new(false), &AtomicBool::new(false), |_| {}).is_err());
     }
 
     #[test]
@@ -451,10 +536,10 @@ mod tests {
         fs::write(root.join("a.bin"), "one").unwrap();
         let db = dir.path().join("idx.sqlite");
         let token = AtomicBool::new(false);
-        refresh(&db, root.to_str().unwrap(), None, &token, |_| {}).unwrap();
+        refresh(&db, root.to_str().unwrap(), None, &token, &AtomicBool::new(false), |_| {}).unwrap();
         fs::write(root.join("b.bin"), "two").unwrap();
         token.store(true, Ordering::Relaxed);
-        assert!(refresh(&db, root.to_str().unwrap(), None, &token, |_| {}).is_err());
+        assert!(refresh(&db, root.to_str().unwrap(), None, &token, &AtomicBool::new(false), |_| {}).is_err());
         let results = search_index(&db, SearchRequest {
             root: root.to_string_lossy().to_string(), regex: None,
             min_size_bytes: None, max_files: None,
