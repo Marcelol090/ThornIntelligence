@@ -179,6 +179,28 @@ export interface IndexedSearch {
   report: SearchReport;
   completedAtUnix: number;
 }
+
+/** Cursor is valid only for one committed index generation and size filter. */
+export interface IndexedPageCursor {
+  generation: number;
+  sizeBytes: number;
+  path: string;
+  minSizeBytes: number;
+}
+export interface IndexedPageRequest {
+  root: string;
+  minSizeBytes: number;
+  pageSize: number;
+  cursor: IndexedPageCursor | null;
+}
+export interface IndexedPage {
+  root: string;
+  generation: number;
+  completedAtUnix: number;
+  minSizeBytes: number;
+  items: FileResult[];
+  nextCursor: IndexedPageCursor | null;
+}
 export interface QuarantinePreview {
   previewId: string;
   path: string;

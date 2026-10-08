@@ -9,7 +9,7 @@ import {
   Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu, ArchiveRestore, CloudOff,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { IndexStats, IndexedSearch, QuarantinePreview, QuarantineItem, CompareReport, CompareRequest, AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
+import type { IndexStats, IndexedSearch, IndexedPage, IndexedPageCursor, IndexedPageRequest, QuarantinePreview, QuarantineItem, CompareReport, CompareRequest, AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -124,6 +124,9 @@ export default function App() {
   const [indexPaused, setIndexPaused] = useState(false);
   const [indexPausePending, setIndexPausePending] = useState(false);
   const [indexStats, setIndexStats] = useState<IndexStats | null>(null);
+  const [indexedPage, setIndexedPage] = useState<IndexedPage | null>(null);
+  const [indexedPageBusy, setIndexedPageBusy] = useState(false);
+  const [indexedPageHistory, setIndexedPageHistory] = useState<(IndexedPageCursor | null)[]>([null]);
   const [useCachedIndex, setUseCachedIndex] = useState(false);
   const [cachedAt, setCachedAt] = useState<number | null>(null);
   const [quarantinePath, setQuarantinePath] = useState('');
@@ -206,6 +209,8 @@ export default function App() {
       const request: ScanRequest = { root: path, regex: pattern.trim() || null, minSizeBytes: Math.floor(parsed * 1024 * 1024), analyzeDuplicates: analyze };
       const result = await invoke<ScanReport>('scan_path', { request, jobId, onProgress });
       setReport(result);
+      setIndexedPage(null);
+      setIndexedPageHistory([null]);
       setSearchResult(null);
       setAllocationReport(null);
       setToast('Análise concluída em ' + duration(result.elapsedMs) + '.');
@@ -409,6 +414,8 @@ export default function App() {
         root: report.root, jobId, onProgress,
       });
       setIndexStats(stats);
+      setIndexedPage(null);
+      setIndexedPageHistory([null]);
       setUseCachedIndex(true);
       setToast('Índice atualizado: ' + number(stats.added) + ' novos, ' +
         number(stats.changed) + ' alterados, ' + number(stats.unchanged) + ' inalterados.');
@@ -425,6 +432,42 @@ export default function App() {
       setIndexPaused(false);
       setIndexPausePending(false);
       setIndexBusy(false);
+    }
+  }
+
+  async function browseIndexPage(
+    cursor: IndexedPageCursor | null, direction: 'first' | 'next' | 'previous',
+  ) {
+    if (!report || indexedPageBusy || activeJob.current || busy || searchBusy || indexBusy) return;
+    setError('');
+    const parsed = Number(minMb);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > Number.MAX_SAFE_INTEGER / 1048576) {
+      setError('Tamanho mínimo inválido para navegar no índice.');
+      return;
+    }
+    const minSizeBytes = Math.floor(parsed * 1048576);
+    if (direction !== 'first' && indexedPage?.minSizeBytes !== minSizeBytes) {
+      setError('Filtro alterado. Reinicie pela primeira página.');
+      return;
+    }
+    setIndexedPageBusy(true);
+    try {
+      const request: IndexedPageRequest = {
+        root: report.root, minSizeBytes, pageSize: 100, cursor,
+      };
+      const page = await invoke<IndexedPage>('browse_index', { request });
+      setIndexedPage(page);
+      setIndexedPageHistory(previous => direction === 'first' ? [null]
+        : direction === 'next' ? [...previous, cursor] : previous.slice(0, -1));
+    } catch (err) {
+      const message = String(err);
+      if (message.includes('Snapshot do índice atualizado')) {
+        setIndexedPage(null);
+        setIndexedPageHistory([null]);
+      }
+      setError('Navegação do índice: ' + message);
+    } finally {
+      setIndexedPageBusy(false);
     }
   }
 
@@ -840,6 +883,44 @@ export default function App() {
               podem estar desatualizados até nova indexação.</p>}
             <p className="panel-note"><LockKeyhole size={14}/> Busca somente por metadados: não abre conteúdo, não recalcula hashes e preserva o relatório de duplicados. Regex usa a sintaxe do Rust regex.</p>
           </section>
+          {useCachedIndex && <section className="panel glass">
+            <SectionHeading kicker="EXPLORAÇÃO PAGINADA" title="Navegar pelo índice completo"
+              description="100 arquivos por página, ordenados por tamanho. Sem OFFSET, sem ler conteúdo e sem carregar milhões de caminhos na memória."/>
+            <p className="panel-note">Use o tamanho mínimo informado acima. Esta navegação não aplica Regex:
+              a pesquisa Regex permanece disponível no formulário. Se o índice mudar, o cursor
+              é recusado e será necessário reiniciar. Os arquivos podem ter mudado desde o snapshot.</p>
+            <div className="index-tools">
+              <button type="button" className="outline-button"
+                disabled={indexedPageBusy || indexBusy || busy || searchBusy}
+                onClick={() => void browseIndexPage(null, 'first')}>
+                {indexedPageBusy ? <LoaderCircle className="spin" size={16}/> : <Database size={16}/>}
+                {indexedPageBusy ? 'Carregando…' : 'Abrir primeira página'}
+              </button>
+              {indexedPage && <span role="status">
+                Página {number(indexedPageHistory.length)} · {number(indexedPage.items.length)} arquivos
+                · snapshot {new Date(indexedPage.completedAtUnix * 1000).toLocaleString('pt-BR')}
+              </span>}
+            </div>
+            {indexedPage && <>
+              {Math.floor(Number(minMb) * 1048576) !== indexedPage.minSizeBytes &&
+                <p className="panel-note" role="status">O filtro mudou. Abra a primeira página para aplicá-lo.</p>}
+              <FileRows files={indexedPage.items} copy={copy}/>
+              <div className="index-tools" role="group" aria-label="Paginação do índice SQLite">
+                <button type="button" className="outline-button"
+                  disabled={indexedPageBusy || indexedPageHistory.length <= 1 ||
+                    Math.floor(Number(minMb) * 1048576) !== indexedPage.minSizeBytes}
+                  onClick={() => void browseIndexPage(indexedPageHistory[indexedPageHistory.length - 2], 'previous')}>
+                  Anterior
+                </button>
+                <button type="button" className="outline-button"
+                  disabled={indexedPageBusy || !indexedPage.nextCursor ||
+                    Math.floor(Number(minMb) * 1048576) !== indexedPage.minSizeBytes}
+                  onClick={() => void browseIndexPage(indexedPage.nextCursor, 'next')}>
+                  Próxima página
+                </button>
+              </div>
+            </>}
+          </section>}
           {searchResult && (searchResult.truncated || searchResult.errors > 0) && <div className="alert warning-alert"><Info size={18}/><span>Busca parcial: {searchResult.truncated ? 'limite explícito de amostragem atingido. ' : ''}{searchResult.errors > 0 ? number(searchResult.errors) + ' entradas inacessíveis.' : ''}</span></div>}
           <section className="panel glass"><SectionHeading kicker="RESULTADOS DE PESQUISA" title={number(searchResult?.totalMatches ?? report.totalMatches) + ' arquivos encontrados'} description="Exibindo até 500 resultados, em ordem decrescente de tamanho."/><FileRows files={searchResult?.matches ?? report.matches} copy={copy}/></section>
         </div>}

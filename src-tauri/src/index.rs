@@ -2,7 +2,7 @@ use crate::scan::{FileResult, ScanProgress};
 use crate::search::{SearchReport, SearchRequest};
 use regex::RegexBuilder;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +31,57 @@ pub struct IndexedSearch {
     pub completed_at_unix: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedPageCursor {
+    pub generation: i64,
+    pub size_bytes: u64,
+    pub path: String,
+    pub min_size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedPageRequest {
+    pub root: String,
+    pub min_size_bytes: Option<u64>,
+    pub page_size: usize,
+    pub cursor: Option<IndexedPageCursor>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedPage {
+    pub root: String,
+    pub generation: i64,
+    pub completed_at_unix: i64,
+    pub min_size_bytes: u64,
+    pub items: Vec<FileResult>,
+    pub next_cursor: Option<IndexedPageCursor>,
+}
+
+fn indexed_content_status(flags: i64) -> String {
+    // Mirrors scan::content_status; no file content or cloud data is opened.
+    let status = if flags & (0x1000 | 0x40000 | 0x400000) != 0 { "offline" }
+        else if flags & 0x400 != 0 { "reparse" } else { "local" };
+    status.to_owned()
+}
+
+fn indexed_file(path: String, size: i64, flags: i64) -> FileResult {
+    let file_path = Path::new(&path);
+    let name = file_path.file_name()
+        .map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+    let extension = file_path.extension()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .filter(|s| !s.is_empty()).unwrap_or_else(|| "sem extensão".into());
+    FileResult {
+        name, path, size_bytes: size.max(0) as u64, extension,
+        content_status: indexed_content_status(flags),
+    }
+}
+
 const INDEX_BATCH_SIZE: usize = 1024;
+const MAX_INDEX_PAGE_SIZE: usize = 200;
 
 struct StagedFile {
     path: String,
@@ -119,6 +169,8 @@ pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
         );
         CREATE INDEX IF NOT EXISTS idx_indexed_files_generation
           ON indexed_files(root, generation, size_bytes DESC);
+        CREATE INDEX IF NOT EXISTS idx_indexed_files_page
+          ON indexed_files(root, generation, size_bytes DESC, path ASC);
     ").map_err(db_err)?;
     Ok(conn)
 }
@@ -353,7 +405,7 @@ pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSea
     let min_size = i64::try_from(request.min_size_bytes.unwrap_or(0))
         .map_err(|_| "Tamanho mínimo fora do intervalo.")?;
     let mut stmt = tx.prepare(
-        "SELECT path,size_bytes FROM indexed_files
+        "SELECT path,size_bytes,attributes FROM indexed_files
          WHERE root=?1 AND generation=?2 AND size_bytes>=?3"
     ).map_err(db_err)?;
     let mut rows = stmt.query(params![root, generation, min_size]).map_err(db_err)?;
@@ -363,17 +415,12 @@ pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSea
     while let Some(row) = rows.next().map_err(db_err)? {
         let path: String = row.get(0).map_err(db_err)?;
         let size: i64 = row.get(1).map_err(db_err)?;
+        let flags: i64 = row.get(2).map_err(db_err)?;
         candidates += 1;
         if regex.as_ref().is_some_and(|p| !p.is_match(&path)) { continue; }
         total += 1;
-        let file_path = Path::new(&path);
-        let name = file_path.file_name()
-            .map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
-        let extension = file_path.extension()
-            .map(|s| s.to_string_lossy().to_ascii_lowercase())
-            .filter(|s| !s.is_empty()).unwrap_or_else(|| "sem extensão".into());
         let size_bytes = size.max(0) as u64;
-        top.insert((size_bytes, path.clone()), FileResult { name, path, size_bytes, extension });
+        top.insert((size_bytes, path.clone()), indexed_file(path, size, flags));
         if top.len() > 500 { top.pop_first(); }
     }
     drop(rows);
@@ -390,10 +437,154 @@ pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSea
     })
 }
 
+
+/// Bounded read-only keyset pagination of one committed SQLite generation.
+/// No OFFSET, filesystem traversal, file content access, or unbounded result vector.
+pub fn browse_index(db_path: &Path, request: IndexedPageRequest) -> Result<IndexedPage, String> {
+    if request.page_size == 0 || request.page_size > MAX_INDEX_PAGE_SIZE {
+        return Err(format!("Tamanho de página deve estar entre 1 e {MAX_INDEX_PAGE_SIZE}."));
+    }
+    let min_size_bytes = request.min_size_bytes.unwrap_or(0);
+    let min_size = i64::try_from(min_size_bytes)
+        .map_err(|_| "Tamanho mínimo fora do intervalo.")?;
+    let root = std::fs::canonicalize(&request.root)
+        .map_err(|e| format!("Raiz do índice indisponível: {e}"))?
+        .to_string_lossy().into_owned();
+    let mut conn = connection(db_path)?;
+    let tx = conn.transaction().map_err(db_err)?;
+    let (generation, completed_at_unix): (i64, i64) = tx.query_row(
+        "SELECT generation,completed_at_unix FROM indexed_scopes WHERE root=?1",
+        params![root], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(db_err)?
+        .ok_or("Esta pasta ainda não possui snapshot completo. Use Atualizar índice.")?;
+    if let Some(cursor) = &request.cursor {
+        if cursor.generation != generation {
+            return Err("Snapshot do índice atualizado; reinicie a navegação pela primeira página.".into());
+        }
+        if cursor.min_size_bytes != min_size_bytes || cursor.path.is_empty() {
+            return Err("Cursor incompatível com o filtro; reinicie pela primeira página.".into());
+        }
+    }
+    let cursor_size = request.cursor.as_ref()
+        .map(|cursor| i64::try_from(cursor.size_bytes)
+            .map_err(|_| "Cursor de tamanho inválido."))
+        .transpose()?.unwrap_or(i64::MAX);
+    let cursor_path = request.cursor.as_ref().map(|c| c.path.as_str()).unwrap_or("");
+    let sql = if request.cursor.is_some() {
+        "SELECT path,size_bytes,attributes FROM indexed_files
+         WHERE root=?1 AND generation=?2 AND size_bytes>=?3
+           AND (size_bytes<?4 OR (size_bytes=?4 AND path>?5))
+         ORDER BY size_bytes DESC,path ASC LIMIT ?6"
+    } else {
+        "SELECT path,size_bytes,attributes FROM indexed_files
+         WHERE root=?1 AND generation=?2 AND size_bytes>=?3
+         ORDER BY size_bytes DESC,path ASC LIMIT ?6"
+    };
+    let limit = i64::try_from(request.page_size + 1)
+        .map_err(|_| "Tamanho de página inválido.")?;
+    let mut stmt = tx.prepare(sql).map_err(db_err)?;
+    let mut rows = stmt.query(params![root, generation, min_size, cursor_size, cursor_path, limit])
+        .map_err(db_err)?;
+    let mut items = Vec::with_capacity(request.page_size + 1);
+    while let Some(row) = rows.next().map_err(db_err)? {
+        let path: String = row.get(0).map_err(db_err)?;
+        let size: i64 = row.get(1).map_err(db_err)?;
+        let flags: i64 = row.get(2).map_err(db_err)?;
+        items.push(indexed_file(path, size, flags));
+    }
+    let has_more = items.len() > request.page_size;
+    items.truncate(request.page_size);
+    let next_cursor = if has_more {
+        items.last().map(|last| IndexedPageCursor {
+            generation, size_bytes: last.size_bytes, path: last.path.clone(), min_size_bytes,
+        })
+    } else { None };
+    drop(rows);
+    drop(stmt);
+    tx.commit().map_err(db_err)?;
+    Ok(IndexedPage {
+        root, generation, completed_at_unix, min_size_bytes, items, next_cursor,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn keyset_pages_are_bounded_complete_and_cloud_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let root = dir.path().join("scan");
+        fs::create_dir(&root).unwrap();
+        for i in 0..257 {
+            fs::write(root.join(format!("item-{i:04}.bin")), vec![0u8; i % 5 + 1]).unwrap();
+        }
+        refresh(&db, root.to_str().unwrap(), None,
+            &AtomicBool::new(false), &AtomicBool::new(false), |_| {}).unwrap();
+        let marked = root.join("item-0000.bin").display().to_string();
+        connection(&db).unwrap().execute(
+            "UPDATE indexed_files SET attributes=4096 WHERE path=?1", params![marked],
+        ).unwrap();
+        let mut cursor = None;
+        let mut observed = Vec::<(u64, String)>::new();
+        let mut saw_offline = false;
+        loop {
+            let page = browse_index(&db, IndexedPageRequest {
+                root: root.display().to_string(), min_size_bytes: None,
+                page_size: 17, cursor,
+            }).unwrap();
+            assert!(page.items.len() <= 17);
+            for item in page.items {
+                if item.path == marked {
+                    assert_eq!(item.content_status, "offline");
+                    saw_offline = true;
+                }
+                observed.push((item.size_bytes, item.path));
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() { break; }
+        }
+        assert_eq!(observed.len(), 257);
+        assert!(saw_offline);
+        let mut unique = std::collections::HashSet::new();
+        assert!(observed.iter().all(|(_, path)| unique.insert(path.clone())));
+        assert!(observed.windows(2).all(|w|
+            w[0].0 > w[1].0 || (w[0].0 == w[1].0 && w[0].1 < w[1].1)
+        ));
+    }
+
+    #[test]
+    fn keyset_cursor_rejects_new_generation_and_changed_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let root = dir.path().join("scan");
+        fs::create_dir(&root).unwrap();
+        for i in 0..3 { fs::write(root.join(format!("{i}.txt")), "x").unwrap(); }
+        refresh(&db, root.to_str().unwrap(), None,
+            &AtomicBool::new(false), &AtomicBool::new(false), |_| {}).unwrap();
+        let first = browse_index(&db, IndexedPageRequest {
+            root: root.display().to_string(), min_size_bytes: Some(0),
+            page_size: 1, cursor: None,
+        }).unwrap();
+        let cursor = first.next_cursor.unwrap();
+        assert!(browse_index(&db, IndexedPageRequest {
+            root: root.display().to_string(), min_size_bytes: Some(1),
+            page_size: 1, cursor: Some(cursor.clone()),
+        }).unwrap_err().contains("Cursor incompatível"));
+        fs::write(root.join("new.txt"), "new").unwrap();
+        refresh(&db, root.to_str().unwrap(), None,
+            &AtomicBool::new(false), &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(browse_index(&db, IndexedPageRequest {
+            root: root.display().to_string(), min_size_bytes: Some(0),
+            page_size: 1, cursor: Some(cursor),
+        }).unwrap_err().contains("Snapshot do índice atualizado"));
+        assert!(browse_index(&db, IndexedPageRequest {
+            root: root.display().to_string(), min_size_bytes: None,
+            page_size: 201, cursor: None,
+        }).is_err());
+    }
 
     #[test]
     fn updates_only_changed_entries_and_prunes_removed_entries() {
