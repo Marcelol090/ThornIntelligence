@@ -164,3 +164,14 @@ O índice atualizado ainda percorre diretórios inteiros para detectar alteraç�
 - maxFiles é opcional na atualização do índice, sem teto de 250 mil. Limite explícito interrompe sem publicar snapshot incompleto.
 - Quarentena não é modificada. Para validação local: PowerShell 7, scripts/validate-windows.ps1.
 - Fontes Exa: https://sqlite.org/wal.html ; https://sqlite.org/forum/info/7da967e0141c7a1466755f8659f7cb0fea22f75cf6 ; https://docs.rs/rusqlite/latest/rusqlite/ .
+
+
+### Pausa cooperativa da indexação (sem atalhos inseguros)
+
+- `ScanJobs::start_index` aloca flags separadas de cancelamento e pausa para o job com ID único. Nenhum outro tipo de job pode receber pausa.
+- `pause_index(jobId)` ativa o sinal de pausa e `resume_index(jobId)` o desativa. A indexação chama `wait_indexer` antes de cada entrada e antes de iniciar a transação de publicação; o estado PAUSED aparece na UI.
+- A pausa usa espera cooperativa limitada a intervalos de 50 ms. Chamadas síncronas já em andamento de disco ou de SQLite não podem ser interrompidas instantaneamente.
+- `cancel_scan` libera qualquer pausa e aciona o cancelamento, preservando a geração antiga; ao concluir/cancelar a sessão, as flags perdem seu efeito e não podem interromper uma operação futura.
+- A pausa não persiste o cursor `walkdir` no disco. Após reinício, reenumerar arquivos evita ignorar alterações ocorridas desde o último checkpoint. Só considerar retomada durável depois de validar o USN Journal do volume, o ID do journal e os limites de registros disponíveis, com fallback para enumeração completa se não puder comprovar consistência.
+- Testes Rust simulam pause/resume após o primeiro lote e cancelamento durante pausa; também verificam que flags de jobs antigos não se propagam e que os demais comandos não podem ser pausados.
+- Pesquisa Exa: https://learn.microsoft.com/en-us/windows/win32/fileio/walking-a-buffer-of-change-journal-records ; https://docs.rs/ntfs-reader/latest/ntfs_reader/guide/journal/index.html ; https://sqlite.org/wal.html .

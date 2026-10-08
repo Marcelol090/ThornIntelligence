@@ -106,3 +106,8 @@ Antes de disponibilizar produção, é obrigatório executar o build Rust/Window
 ### Indexação de metadados em lotes
 
 O comando Atualizar índice SQLite agora permite todas as entradas acessíveis sem limite numérico automático, e informa quantos lotes de até 1.024 linhas foram gravados. O índice publicado só muda ao completar toda a enumeração; cancelamento descarta a nova geração. Ainda não há retomada real após crash, e o estágio provisório consome espaço adicional. Use pwsh -File scripts/validate-windows.ps1 em Windows para verificar frontend e Rust. A varredura principal somente perde o antigo teto de 250 mil quando as mudanças independentes do PR #11 forem integradas.
+
+
+### Pausar e retomar a indexação sem perder a operação ativa
+
+Durante Atualizar índice SQLite, use **Pausar** para interromper a enumeração entre entradas; o contador permanece visível e a tarefa conserva a sessão ativa. Use **Retomar** para continuar a partir do mesmo iterador, sem começar novamente, enquanto o aplicativo continuar aberto. **Cancelar** também funciona durante a pausa: o token de cancelamento acorda o indexador e impede publicar dados incompletos. Só a geração final, totalmente varrida, aparece nas pesquisas. O sistema consulta o token a cada entrada, com atraso de até aproximadamente 50 ms entre verificações (chamadas de disco bloqueadas podem demorar mais). Não é um recurso de retomada após desligamento/reinício: os metadados podem mudar enquanto a máquina está offline e o índice será reenumerado em uma nova tentativa. Consulte docs/ARCHITECTURE.md.

@@ -92,6 +92,8 @@ export default function App() {
   const [diskHealth, setDiskHealth] = useState<DiskHealth | null>(null);
   const [healthBusy, setHealthBusy] = useState(false);
   const [indexBusy, setIndexBusy] = useState(false);
+  const [indexPaused, setIndexPaused] = useState(false);
+  const [indexPausePending, setIndexPausePending] = useState(false);
   const [indexStats, setIndexStats] = useState<IndexStats | null>(null);
   const [useCachedIndex, setUseCachedIndex] = useState(false);
   const [cachedAt, setCachedAt] = useState<number | null>(null);
@@ -217,17 +219,39 @@ export default function App() {
     }
   }
 
+  async function toggleIndexPause() {
+    const jobId = activeJob.current;
+    if (!jobId || !indexBusy || indexPausePending || cancelRequested) return;
+    const shouldPause = !indexPaused;
+    setIndexPausePending(true);
+    try {
+      const accepted = await invoke<boolean>(shouldPause ? 'pause_index' : 'resume_index', { jobId });
+      if (accepted) setIndexPaused(shouldPause);
+      else setError('A tarefa já terminou ou não aceita pausa.');
+    } catch (err) {
+      setError('Não foi possível alterar o estado da indexação: ' + String(err));
+    } finally {
+      setIndexPausePending(false);
+    }
+  }
+
   async function refreshIndex() {
     if (!report || activeJob.current || busy || searchBusy || indexBusy) return;
     setError('');
     const jobId = crypto.randomUUID();
     const onProgress = new Channel<ScanProgress>();
     onProgress.onmessage = (event) => {
-      if (activeJob.current === jobId) setScanProgress(event);
+      if (activeJob.current === jobId) {
+        setScanProgress(event);
+        if (event.phase === 'paused') setIndexPaused(true);
+        if (event.phase === 'indexing') setIndexPaused(false);
+      }
     };
     activeJob.current = jobId;
     setScanProgress(null);
     setCancelRequested(false);
+    setIndexPaused(false);
+    setIndexPausePending(false);
     setIndexBusy(true);
     try {
       const stats = await invoke<IndexStats>('refresh_index', {
@@ -245,6 +269,8 @@ export default function App() {
       if (activeJob.current === jobId) activeJob.current = null;
       setScanProgress(null);
       setCancelRequested(false);
+      setIndexPaused(false);
+      setIndexPausePending(false);
       setIndexBusy(false);
     }
   }
@@ -394,11 +420,18 @@ export default function App() {
             <strong>{scanProgress?.phase === 'hashing' ? 'Verificando duplicados com BLAKE3' :
               scanProgress?.phase === 'verifying' ? 'Conferindo identidades físicas' :
               scanProgress?.phase === 'searching' ? 'Pesquisando metadados' :
+              scanProgress?.phase === 'paused' ? 'Indexação pausada pelo usuário' :
               scanProgress?.phase === 'indexing' ? 'Atualizando índice SQLite' : 'Analisando diretórios'}</strong>
             <small>{number(scanProgress?.filesScanned ?? 0)} arquivos processados
               {scanProgress && scanProgress.hashBytesRead > 0 ? ' · ' + bytes(scanProgress.hashBytesRead) + ' lidos por hash' : ''}
             </small>
           </div>
+          {indexBusy && <button type="button" className="outline-button"
+            disabled={!scanProgress || indexPausePending || cancelRequested}
+            aria-label={indexPaused ? 'Retomar indexação' : 'Pausar indexação'}
+            onClick={() => void toggleIndexPause()}>
+            {indexPausePending ? 'Aguarde…' : indexPaused ? 'Retomar' : 'Pausar'}
+          </button>}
           <button type="button" className="outline-button" disabled={cancelRequested || !scanProgress}
             title={!scanProgress ? 'Aguardando inicialização no backend' : 'Interromper a operação atual'}
             onClick={() => void cancelCurrentScan()}>
@@ -458,7 +491,8 @@ export default function App() {
             <p className="panel-note"><Database size={14}/> Indexação sem teto artificial de arquivos.
               Registros são gravados em lotes de até 1.024; o snapshot anterior continua
               disponível até a atualização terminar. Cancelar não publica índices parciais.
-              Uma interrupção ainda requer nova enumeração na próxima tentativa.</p>
+              Pausar/Retomar mantém a tarefa ativa sem publicar dados parciais.
+              Após fechar o aplicativo, é necessária nova enumeração para validar mudanças.</p>
             <div className="index-tools">
               <button type="button" className="outline-button" disabled={indexBusy || busy || searchBusy}
                 onClick={() => void refreshIndex()}>

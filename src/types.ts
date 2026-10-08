@@ -98,7 +98,7 @@ export type Section = 'overview' | 'explorer' | 'duplicates' | 'search' | 'optim
 
 /** Lightweight IPC progress; no per-file paths or file contents are sent. */
 export interface ScanProgress {
-  phase: 'scanning' | 'indexing' | 'hashing' | 'verifying' | 'searching' | 'complete';
+  phase: 'scanning' | 'indexing' | 'paused' | 'hashing' | 'verifying' | 'searching' | 'complete';
   filesScanned: number;
   hashBytesRead: number;
 }
