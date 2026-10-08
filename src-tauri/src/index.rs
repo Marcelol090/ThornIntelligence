@@ -627,6 +627,52 @@ mod tests {
     }
 
     #[test]
+    fn existing_sqlite_index_migrates_parent_columns_without_corrupting_old_files() {
+        let tmp=tempfile::tempdir().unwrap();
+        let root=tmp.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("keep.txt"),b"hello").unwrap();
+        let db=tmp.path().join("legacy.sqlite");
+        let legacy=Connection::open(&db).unwrap();
+        legacy.execute_batch(
+            "CREATE TABLE indexed_scopes(
+                root TEXT PRIMARY KEY,generation INTEGER NOT NULL,
+                completed_at_unix INTEGER NOT NULL,file_count INTEGER NOT NULL);
+             CREATE TABLE indexed_files(
+                root TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL,attributes INTEGER NOT NULL,
+                generation INTEGER NOT NULL,PRIMARY KEY(root,path));
+             CREATE TABLE indexed_stage(
+                root TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL,attributes INTEGER NOT NULL,
+                PRIMARY KEY(root,path));"
+        ).unwrap();
+        legacy.execute(
+            "INSERT INTO indexed_scopes VALUES(?1,1,123,1)",
+            params![root.display().to_string()],
+        ).unwrap();
+        legacy.execute(
+            "INSERT INTO indexed_files VALUES(?1,?2,5,0,0,1)",
+            params![root.display().to_string(),root.join("keep.txt").display().to_string()],
+        ).unwrap();
+        drop(legacy);
+        let upgraded=connection(&db).unwrap();
+        let prior: i64=upgraded.query_row(
+            "SELECT COUNT(*) FROM indexed_files WHERE size_bytes=5",
+            [],|r| r.get(0),
+        ).unwrap();
+        assert_eq!(prior,1);
+        drop(upgraded);
+        // Existing file rows have no derived directory tree until reindexed.
+        assert!(browse_tree(&db,tree_req(&root,&root,100,None,None)).is_err());
+        refresh(&db,root.to_str().unwrap(),None,&AtomicBool::new(false),
+            &AtomicBool::new(false), |_| {}).unwrap();
+        let page=browse_tree(&db,tree_req(&root,&root,100,None,None)).unwrap();
+        assert_eq!(page.nodes.len(),1);
+        assert_eq!(page.nodes[0].name,"keep.txt");
+    }
+
+    #[test]
     fn lazy_tree_paginates_direct_children_with_files_after_directories() {
         let tmp=tempfile::tempdir().unwrap();
         let root=tmp.path().join("scope");
