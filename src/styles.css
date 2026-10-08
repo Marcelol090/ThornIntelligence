@@ -239,3 +239,77 @@ small{font-size:12px}
 .activity-details small{font-size:11px;color:#8fa4bd}
 .scan-activity .outline-button{min-height:36px}
 @media(max-width:570px){.scan-activity{flex-wrap:wrap}.scan-activity .outline-button{width:100%}}
+
+/* Windows DWM Acrylic (Mica fallback): the WebView root MUST NOT
+   paint over the Windows material. CSS backdrop-filter alone only blurs
+   content inside the WebView, not the Windows desktop.
+   Retain the solid dark fallback until the window-effect call succeeds. */
+html.native-vibrancy,
+html.native-vibrancy #root{
+  background-color:transparent!important;
+}
+html.native-vibrancy body{
+  background:
+    radial-gradient(ellipse 76% 65% at 48% -10%,rgba(52,99,168,.16),transparent 75%),
+    radial-gradient(ellipse 54% 62% at 105% 63%,rgba(88,69,160,.13),transparent 76%),
+    rgba(6,12,25,.17)!important;
+}
+html.native-vibrancy .app-shell{background:transparent}
+html.native-vibrancy .main-shell{background:rgba(7,13,28,.16)}
+html.native-vibrancy .sidebar{
+  background:linear-gradient(155deg,rgba(21,39,67,.40),rgba(8,19,39,.43));
+  backdrop-filter:blur(28px) saturate(1.22);
+  -webkit-backdrop-filter:blur(28px) saturate(1.22);
+}
+html.native-vibrancy .glass{
+  background:linear-gradient(138deg,rgba(45,76,125,.32),rgba(14,30,56,.33) 76%);
+  border-color:rgba(196,223,255,.21);
+  box-shadow:inset 0 1px rgba(255,255,255,.14),0 18px 42px rgba(2,4,12,.19);
+  backdrop-filter:blur(26px) saturate(1.3);
+  -webkit-backdrop-filter:blur(26px) saturate(1.3);
+}
+html.native-vibrancy .glass-inset{
+  background:rgba(19,43,72,.30);
+  border-color:rgba(170,210,255,.18);
+}
+/* API success means Windows accepted the effect request; it does not
+   guarantee visible glass if Windows transparency is disabled or WebView2
+   and DWM do not render a system backdrop on this machine. */
+.effect-pill{
+  color:#9fd2ff;
+  background:rgba(51,92,139,.24);
+  border:1px solid rgba(135,195,255,.2);
+  padding:6px 9px;
+  border-radius:999px;
+  font-size:10px;
+  font-weight:650;
+  white-space:nowrap;
+}
+.effect-pill.is-unavailable{color:#edc08b;border-color:rgba(242,177,101,.3);background:rgba(93,61,32,.22)}
+@media(max-width:1040px){.effect-pill{display:none}}
+/* A disabled DWM transparency setting may make the desktop backdrop solid.
+   In either case foreground contrast is preserved by tinted panels. */
+.storage-filters{display:flex;flex-wrap:wrap;gap:8px;margin:15px 0 10px}
+.storage-filter{display:inline-flex;align-items:center;gap:7px;padding:9px 13px;border-radius:10px;
+  border:1px solid rgba(159,201,255,.17);color:#9bb2ce;background:rgba(35,59,95,.18);font-size:11px}
+.storage-filter.active{border-color:rgba(125,192,255,.64);background:rgba(37,102,179,.35);color:#d0eaff}
+.storage-filter:focus-visible{outline:2px solid #81c8ff;outline-offset:2px}
+.storage-status{display:block;margin-top:4px;font-size:10px;font-weight:700;line-height:1.3}
+.storage-status.remote{color:#f0c68e}
+.storage-status.reparse{color:#96c9f2}
+
+/* Quick inventory by default; expensive content hashing remains opt-in. */
+.scan-controls{display:flex;flex-direction:column;align-items:flex-end;gap:9px}
+.scan-hash-option{display:flex;align-items:center;gap:9px;color:#b7cee8;font-size:12px;cursor:pointer}
+.scan-hash-option input{width:17px;height:17px;accent-color:#69baff}
+.scan-hash-option span{display:grid;gap:2px}
+.scan-hash-option small{font-size:10px;color:#8ba5c2}
+@media(max-width:650px){.scan-controls{align-items:stretch;width:100%}.scan-controls .primary-button{justify-content:center}.scan-hash-option{justify-content:flex-start}}
+
+/* Read-only allocation view for the top 300. Do not imply physical reclaim. */
+.allocation-actions{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:10px}
+.allocation-actions .outline-button{display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.size-cell{display:flex;flex-direction:column;align-items:flex-end;gap:5px;min-width:0}
+.size-cell strong{white-space:nowrap}
+.allocation-detail{font-size:10px;line-height:1.35;font-weight:500;color:#89ceca;text-align:right;max-width:145px}
+@media(max-width:750px){.allocation-actions{justify-content:flex-start}.allocation-detail{max-width:100px}}

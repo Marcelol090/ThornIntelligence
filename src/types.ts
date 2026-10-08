@@ -3,6 +3,7 @@ export interface FileResult {
   path: string;
   sizeBytes: number;
   extension: string;
+  contentStatus: 'local' | 'offline' | 'reparse';
 }
 
 export interface DirectoryResult {
@@ -35,6 +36,7 @@ export interface ScanReport {
   errorSamples: string[];
   truncated: boolean;
   duplicateAnalysisComplete: boolean;
+  hashingSkipped: boolean;
   hardlinkAliases: number;
   skippedContentFiles: number;
   hashBytesRead: number;
@@ -51,14 +53,17 @@ export interface ScanRequest {
   root: string;
   regex: string | null;
   minSizeBytes: number;
-  maxFiles: number;
+  /** Omit to scan every accessible file; set only for explicit sampling. */
+  maxFiles?: number;
+  analyzeDuplicates?: boolean;
 }
 
 export interface SearchRequest {
   root: string;
   regex: string | null;
   minSizeBytes: number;
-  maxFiles: number;
+  /** Omit to scan every accessible file; set only for explicit sampling. */
+  maxFiles?: number;
 }
 
 export interface SearchReport {
@@ -98,7 +103,32 @@ export type Section = 'overview' | 'explorer' | 'duplicates' | 'search' | 'optim
 
 /** Lightweight IPC progress; no per-file paths or file contents are sent. */
 export interface ScanProgress {
-  phase: 'scanning' | 'hashing' | 'verifying' | 'searching' | 'complete';
+  phase: 'scanning' | 'fingerprinting' | 'hashing' | 'verifying' | 'searching' | 'allocation' | 'complete';
   filesScanned: number;
   hashBytesRead: number;
+}
+
+/** Read-only per-file Windows allocation query; never estimates recoverable space. */
+export interface AllocationTarget {
+  path: string;
+  expectedSizeBytes: number;
+}
+export interface AllocationRequest {
+  root: string;
+  targets: AllocationTarget[];
+}
+export interface AllocationItem {
+  path: string;
+  logicalBytes: number;
+  allocatedBytes: number | null;
+  /** Volume-wide NTFS hardlink count; not confined to selected root. */
+  hardlinkCount: number | null;
+  status: 'measured' | 'excluded' | 'changed' | 'outside' | 'unavailable' | 'unsupported';
+}
+export interface AllocationReport {
+  items: AllocationItem[];
+  measured: number;
+  skipped: number;
+  failed: number;
+  elapsedMs: number;
 }

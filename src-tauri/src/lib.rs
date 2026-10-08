@@ -1,9 +1,11 @@
+mod allocation;
 mod health;
 mod jobs;
 mod optimize;
 mod scan;
 mod search;
 
+use allocation::{AllocationReport, AllocationRequest};
 use health::DiskHealth;
 use jobs::ScanJobs;
 use optimize::OptimizationResult;
@@ -55,6 +57,27 @@ async fn search_path(
 }
 
 #[tauri::command]
+async fn measure_allocated_sizes(
+    request: AllocationRequest,
+    job_id: String,
+    on_progress: Channel<ScanProgress>,
+    jobs: State<'_, Arc<ScanJobs>>,
+) -> Result<AllocationReport, String> {
+    let jobs = Arc::clone(jobs.inner());
+    let token = jobs.start(job_id.clone())?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        allocation::measure(request, token.as_ref(), |event| {
+            let _ = on_progress.send(event);
+        })
+    })
+    .await
+    .map_err(|err| format!("Falha interna ao medir espaço em disco: {err}"))
+    .and_then(|result| result);
+    jobs.finish(&job_id);
+    result
+}
+
+#[tauri::command]
 fn cancel_scan(job_id: String, jobs: State<'_, Arc<ScanJobs>>) -> Result<bool, String> {
     jobs.cancel(&job_id)
 }
@@ -84,7 +107,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(optimize::OptimizationGate::default()))
         .manage(Arc::new(ScanJobs::default()))
-        .invoke_handler(tauri::generate_handler![scan_path, search_path, cancel_scan, optimize_volume, disk_health])
+        .invoke_handler(tauri::generate_handler![scan_path, search_path, measure_allocated_sizes, cancel_scan, optimize_volume, disk_health])
         .run(tauri::generate_context!())
         .expect("error while running Thorn Intelligence");
 }

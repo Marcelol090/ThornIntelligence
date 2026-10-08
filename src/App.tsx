@@ -1,14 +1,15 @@
-import { useRef, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
 import { Channel, invoke } from '@tauri-apps/api/core';
+import { Effect, EffectState, getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
   Activity, AlertCircle, ArrowRight, ArrowUpRight,
   BarChart3, Check, CheckCircle2, ChevronRight, CircleHelp, Clipboard,
   Database, Disc3, File, FileSearch, Fingerprint, Folder, FolderOpen,
-  Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu,
+  Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu, CloudOff,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
+import type { AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -46,13 +47,32 @@ function Tag({ children, tone = 'neutral' }: { children: ReactNode; tone?: strin
   return <span className={'tag tag-' + tone}>{children}</span>;
 }
 
-function FileRows({ files, copy }: { files: FileResult[]; copy: (path: string) => void }) {
+function FileRows({ files, copy, allocations }: {
+  files: FileResult[];
+  copy: (path: string) => void;
+  allocations?: Record<string, AllocationItem>;
+}) {
   if (!files.length) return <div className="empty-list">Nenhum arquivo encontrado nesta visualização.</div>;
   return <div className="file-table">
     <div className="file-table-head"><span>ARQUIVO</span><span>TIPO</span><span>TAMANHO</span><span></span></div>
     {files.map((file) => <div className="file-row" key={file.path}>
       <span className="file-identity"><span className="file-icon"><File size={18}/></span><span className="file-text"><strong title={file.name}>{file.name}</strong><small title={file.path}>{truncatePath(file.path, 64)}</small></span></span>
-      <span className="type-cell">{file.extension}</span><strong className="size-cell">{bytes(file.sizeBytes)}</strong>
+      <span className="type-cell">{file.extension}
+        {file.contentStatus === 'offline' && <small className="storage-status remote" title="Metadados indicam armazenamento remoto/offline; o aplicativo não abriu o conteúdo">Remoto/offline</small>}
+        {file.contentStatus === 'reparse' && <small className="storage-status reparse" title="Arquivo virtual ou redirecionado (reparse point); conteúdo não foi aberto">Redirecionado</small>}
+      </span><span className="size-cell"><strong>{bytes(file.sizeBytes)}</strong>
+        {allocations?.[file.path] && <small className="allocation-detail" title={
+          allocations[file.path].status === 'measured'
+            ? 'Alocação do filesystem via FileStandardInfo: não é espaço recuperável'
+            : 'Medição omitida: arquivo alterado, virtual, fora do escopo ou inacessível'
+        }>{allocations[file.path].allocatedBytes !== null
+            ? 'Em disco: ' + bytes(allocations[file.path].allocatedBytes as number)
+            : 'Em disco: indisponível'}</small>}
+        {(allocations?.[file.path]?.hardlinkCount ?? 0) > 1 && <small
+          className="allocation-detail" title="Há outras referências físicas ao mesmo arquivo, possivelmente fora desta pasta. Remover um único nome não recupera esse espaço.">
+          Compartilhado: {allocations?.[file.path]?.hardlinkCount} hardlinks · economia não atribuível
+        </small>}
+      </span>
       <button className="icon-button" type="button" title="Copiar caminho" aria-label={'Copiar caminho de ' + file.name} onClick={() => copy(file.path)}><Clipboard size={16}/></button>
     </div>)}
   </div>;
@@ -80,6 +100,7 @@ export default function App() {
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [cancelRequested, setCancelRequested] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [includeDuplicates, setIncludeDuplicates] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const [regex, setRegex] = useState('');
@@ -90,15 +111,53 @@ export default function App() {
   const [optimizing, setOptimizing] = useState(false);
   const [diskHealth, setDiskHealth] = useState<DiskHealth | null>(null);
   const [healthBusy, setHealthBusy] = useState(false);
+  const [cloudFilter, setCloudFilter] = useState<'all' | 'offline' | 'reparse'>('all');
+  const [allocationBusy, setAllocationBusy] = useState(false);
+  const [allocationReport, setAllocationReport] = useState<AllocationReport | null>(null);
   const [mobileMenu, setMobileMenu] = useState(false);
+  const [windowEffectStatus, setWindowEffectStatus] = useState<'pending' | 'requested' | 'failed'>('pending');
+  const [windowEffectError, setWindowEffectError] = useState('');
+
+  // Acrylic is the visibly translucent Windows 10/11 backdrop; Mica is
+  // a native Windows 11 fallback, not the same as seeing the desktop.
+  // Tauri's window must have transparent:true, and every WebView root
+  // layer must be translucent *before* requesting the Windows backdrop.
+  useEffect(() => {
+    if (!navigator.userAgent.includes('Windows')) return;
+    let mounted = true;
+    const page = document.documentElement;
+    page.classList.add('native-vibrancy');
+    const apply = async () => {
+      try {
+        await getCurrentWindow().setEffects({
+          effects: [Effect.Acrylic, Effect.Mica],
+          state: EffectState.Active,
+        });
+        if (mounted) setWindowEffectStatus('requested');
+      } catch (err) {
+        // Previously swallowed every error, leaving an unexplained solid UI.
+        console.warn('[Thorn Intelligence] Native Windows backdrop unavailable:', err);
+        if (mounted) {
+          page.classList.remove('native-vibrancy');
+          setWindowEffectError(String(err));
+          setWindowEffectStatus('failed');
+        }
+      }
+    };
+    void apply();
+    return () => {
+      mounted = false;
+      page.classList.remove('native-vibrancy');
+    };
+  }, []);
 
   async function copy(value: string) {
     try { await navigator.clipboard.writeText(value); setToast('Caminho copiado.'); }
     catch { setToast('Não foi possível copiar o caminho.'); }
   }
 
-  async function scanFolder(root?: string, pattern = regex, min = minMb) {
-    if (activeJob.current || busy || searchBusy) {
+  async function scanFolder(root?: string, pattern = regex, min = minMb, analyze = includeDuplicates) {
+    if (activeJob.current || busy || searchBusy || allocationBusy) {
       setError('Já existe uma análise em andamento.');
       return;
     }
@@ -126,10 +185,11 @@ export default function App() {
     try {
       const parsed = Number(min);
       if (!Number.isFinite(parsed) || parsed < 0) throw new Error('Tamanho mínimo inválido.');
-      const request: ScanRequest = { root: path, regex: pattern.trim() || null, minSizeBytes: Math.floor(parsed * 1024 * 1024), maxFiles: 250_000 };
+      const request: ScanRequest = { root: path, regex: pattern.trim() || null, minSizeBytes: Math.floor(parsed * 1024 * 1024), analyzeDuplicates: analyze };
       const result = await invoke<ScanReport>('scan_path', { request, jobId, onProgress });
       setReport(result);
       setSearchResult(null);
+      setAllocationReport(null);
       setToast('Análise concluída em ' + duration(result.elapsedMs) + '.');
     } catch (err) {
       const message = String(err);
@@ -145,7 +205,7 @@ export default function App() {
 
   async function searchMetadata() {
     if (!report) return;
-    if (activeJob.current || busy || searchBusy) {
+    if (activeJob.current || busy || searchBusy || allocationBusy) {
       setError('Já existe uma operação em andamento.');
       return;
     }
@@ -168,8 +228,7 @@ export default function App() {
         root: report.root,
         regex: regex.trim() || null,
         minSizeBytes: Math.floor(parsed * 1048576),
-        maxFiles: 250_000,
-      };
+       };
       const result = await invoke<SearchReport>('search_path', { request, jobId, onProgress });
       setSearchResult(result);
       setToast('Busca por metadados concluída em ' + duration(result.elapsedMs) + '.');
@@ -182,6 +241,43 @@ export default function App() {
       setScanProgress(null);
       setCancelRequested(false);
       setSearchBusy(false);
+    }
+  }
+
+  async function measureAllocated() {
+    if (!report || !report.topFiles.length || activeJob.current || busy || searchBusy || allocationBusy) return;
+    setError('');
+    const jobId = crypto.randomUUID();
+    const onProgress = new Channel<ScanProgress>();
+    onProgress.onmessage = (event) => {
+      if (activeJob.current === jobId) setScanProgress(event);
+    };
+    activeJob.current = jobId;
+    setScanProgress(null);
+    setCancelRequested(false);
+    setAllocationBusy(true);
+    try {
+      const request: AllocationRequest = {
+        root: report.root,
+        targets: report.topFiles.slice(0, 300).map(file => ({
+          path: file.path, expectedSizeBytes: file.sizeBytes,
+        })),
+      };
+      const result = await invoke<AllocationReport>('measure_allocated_sizes', {
+        request, jobId, onProgress,
+      });
+      setAllocationReport(result);
+      setToast('Alocação consultada em ' + duration(result.elapsedMs)
+        + ' · ' + number(result.measured) + ' arquivos medidos.');
+    } catch (err) {
+      const message = String(err);
+      if (message.includes('cancelada')) setToast('Medição cancelada; os resultados anteriores foram preservados.');
+      else setError('Não foi possível medir o espaço alocado: ' + message);
+    } finally {
+      if (activeJob.current === jobId) activeJob.current = null;
+      setScanProgress(null);
+      setCancelRequested(false);
+      setAllocationBusy(false);
     }
   }
 
@@ -264,24 +360,53 @@ export default function App() {
     <div className="main-shell">
       <header className="topbar">
         <div className="crumb"><button className="menu-button icon-button" aria-label="Abrir menu" onClick={() => setMobileMenu(true)}><Menu size={20}/></button><span>Workspace</span><ChevronRight size={14}/><strong>{links.find((link) => link.id === section)?.label}</strong></div>
-        <div className="top-actions"><span className="local-pill"><span className="live-dot"/> LOCAL-FIRST</span><button className="top-help" onClick={() => selectSection('optimize')} title="Conheça os controles de segurança" aria-label="Segurança"><CircleHelp size={19}/></button><div className="user-avatar"><Disc3 size={17}/></div></div>
+        <div className="top-actions">
+          {navigator.userAgent.includes('Windows') && <span
+            className={'effect-pill ' + (windowEffectStatus === 'failed' ? 'is-unavailable' : '')}
+            role="status"
+            title={windowEffectStatus === 'failed'
+              ? 'Mica/Acrylic não puderam ser solicitados: ' + windowEffectError
+              : windowEffectStatus === 'requested'
+                ? 'Efeito solicitado ao Windows. A aparência final depende dos efeitos de transparência do sistema, WebView2 e DWM.'
+                : 'Inicializando o efeito nativo do Windows.'}>
+            {windowEffectStatus === 'failed' ? 'Vidro indisponível'
+              : windowEffectStatus === 'requested' ? 'Acrylic solicitado'
+              : 'Ativando vidro…'}
+          </span>}
+          <span className="local-pill"><span className="live-dot"/> LOCAL-FIRST</span><button className="top-help" onClick={() => selectSection('optimize')} title="Conheça os controles de segurança" aria-label="Segurança"><CircleHelp size={19}/></button><div className="user-avatar"><Disc3 size={17}/></div></div>
       </header>
       <main id="main-content" className="content">
         <div className="hero-heading">
           <div><div className="hero-kicker"><Sparkles size={14}/> ARMAZENAMENTO SOB CONTROLE</div><h1>{links.find((link) => link.id === section)?.label}<span className="heading-period">.</span></h1><p>Descubra o que ocupa espaço, identifique desperdícios e tome decisões com segurança.</p></div>
-          <button className="primary-button" disabled={busy || searchBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
+          <div className="scan-controls">
+            <label className="scan-hash-option" title="Modo rápido: só inventário. Ative para detectar duplicados por BLAKE3.">
+              <input type="checkbox" checked={includeDuplicates} disabled={busy || searchBusy}
+                onChange={event => setIncludeDuplicates(event.target.checked)}/>
+              <span>Incluir BLAKE3 <small>{includeDuplicates ? 'Varredura completa (mais I/O)' : 'Desativado: modo rápido'}</small></span>
+            </label>
+            <button className="primary-button" disabled={busy || searchBusy || allocationBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
+          </div>
         </div>
 
         <div className="scope-strip glass"><div className="scope-icon"><Folder size={19}/></div><div className="scope-details"><small>ESCOPO ATUAL</small><strong title={roots}>{scopeName}</strong></div><span className="scope-full" title={roots}>{scanned ? truncatePath(roots, 56) : 'Escolha uma pasta ou unidade para iniciar'}</span><Tag tone={scanned ? 'green' : 'neutral'}>{scanned ? 'ANALISADO' : 'AGUARDANDO'}</Tag></div>
 
-        {(busy || searchBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
+        {(busy || searchBusy || allocationBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
           <div className="activity-spinner"><LoaderCircle size={20} className="spin"/></div>
           <div className="activity-details">
             <strong>{scanProgress?.phase === 'hashing' ? 'Verificando duplicados com BLAKE3' :
               scanProgress?.phase === 'verifying' ? 'Conferindo identidades físicas' :
-              scanProgress?.phase === 'searching' ? 'Pesquisando metadados' : 'Analisando diretórios'}</strong>
-            <small>{number(scanProgress?.filesScanned ?? 0)} arquivos processados
-              {scanProgress && scanProgress.hashBytesRead > 0 ? ' · ' + bytes(scanProgress.hashBytesRead) + ' lidos por hash' : ''}
+              scanProgress?.phase === 'searching' ? 'Pesquisando metadados' :
+              scanProgress?.phase === 'allocation' ? 'Consultando alocação no Windows' :
+              scanProgress?.phase === 'fingerprinting' ? 'Comparando amostras de 16 KiB' :
+              'Analisando diretórios'}</strong>
+            <small>{number(scanProgress?.filesScanned ?? 0)} {
+              scanProgress?.phase === 'allocation' ? 'arquivos medidos/consultados' :
+              scanProgress?.phase === 'hashing' ? 'candidatos com BLAKE3 completo' :
+              scanProgress?.phase === 'fingerprinting' ? 'candidatos amostrados' :
+              'arquivos enumerados'
+            }{scanProgress && scanProgress.hashBytesRead > 0
+              ? ' · ' + bytes(scanProgress.hashBytesRead) + ' lidos no total (amostras + BLAKE3)'
+              : ''}
             </small>
           </div>
           <button type="button" className="outline-button" disabled={cancelRequested || !scanProgress}
@@ -292,7 +417,8 @@ export default function App() {
         </div>}
         {error && <div role="alert" className="alert error-alert"><AlertCircle size={19}/><span>{error}</span><button aria-label="Fechar aviso" className="icon-button" onClick={() => setError('')}><X size={16}/></button></div>}
         {toast && <div role="status" className="alert toast-alert"><Check size={17}/><span>{toast}</span><button aria-label="Fechar mensagem" className="icon-button" onClick={() => setToast('')}><X size={16}/></button></div>}
-        {report && (report.truncated || report.errors > 0 || !report.duplicateAnalysisComplete || report.hardlinkAliases > 0 || report.skippedContentFiles > 0) && <div className="alert warning-alert"><Info size={18}/><span>{report.truncated ? 'Limite de 250.000 arquivos atingido; o relatório é parcial. ' : ''}{report.errors > 0 ? number(report.errors) + ' entradas não puderam ser processadas. ' : ''}{!report.duplicateAnalysisComplete ? 'Análise de duplicados incompleta (limite de leitura, arquivos indisponíveis ou modificados); pode haver mais cópias. ' : ''}{report.hardlinkAliases > 0 ? number(report.hardlinkAliases) + ' links físicos compartilhados foram excluídos das estimativas. ' : ''}{report.skippedContentFiles > 0 ? number(report.skippedContentFiles) + ' arquivos de conteúdo remoto/offline ou reparse foram ignorados no hash para evitar downloads involuntários. ' : ''}As estimativas não equivalem a espaço liberado.</span></div>}
+        {report && (report.truncated || report.errors > 0 || !report.duplicateAnalysisComplete || report.hardlinkAliases > 0 || report.skippedContentFiles > 0) && <div className="alert warning-alert"><Info size={18}/><span>{report.truncated ? 'Amostragem solicitada: limite explícito de arquivos atingido; o relatório é parcial. ' : ''}{report.errors > 0 ? number(report.errors) + ' entradas não puderam ser processadas. ' : ''}{report.hashingSkipped ? 'Modo rápido: BLAKE3 não executado. Ative a análise para verificar cópias. ' :
+            !report.duplicateAnalysisComplete ? 'Análise de duplicados incompleta (limite de leitura ou arquivos indisponíveis); pode haver mais cópias. ' : ''}{report.hardlinkAliases > 0 ? number(report.hardlinkAliases) + ' links físicos compartilhados foram excluídos das estimativas. ' : ''}{report.skippedContentFiles > 0 ? number(report.skippedContentFiles) + ' arquivos de conteúdo remoto/offline ou reparse foram ignorados no hash para evitar downloads involuntários. ' : ''}As estimativas não equivalem a espaço liberado.</span></div>}
 
         {!scanned && section !== 'optimize' && <div className="onboarding glass">
           <div className="onboarding-content"><Tag tone="blue"><Sparkles size={13}/> INTELLIGENT STORAGE</Tag><h2>Encontre espaço que você nem sabia que tinha.</h2><p>Mapeie arquivos, compare tamanhos, descubra duplicados reais com BLAKE3 e pesquise nomes ou caminhos usando expressões regulares. Tudo acontece no seu computador.</p><button className="primary-button" disabled={busy} onClick={() => void scanFolder()}><FolderOpen size={18}/> Escolher pasta <ArrowRight size={17}/></button></div>
@@ -302,9 +428,9 @@ export default function App() {
         {section === 'overview' && report && <>
           <div className="metrics-grid">
             <Metric label="Volume analisado" value={bytes(report.logicalBytes)} helper="Tamanho lógico dos arquivos" icon={Database}/>
-            <Metric label="Arquivos indexados" value={number(report.filesScanned)} helper={number(report.directoriesScanned) + ' diretórios percorridos'} icon={FileSearch} tone="violet"/>
-            <Metric label="Espaço duplicado" value={bytes(report.potentialSavingsBytes)} helper="Estimativa, sem exclusões" icon={Fingerprint} tone="mint"/>
-            <Metric label="Grupos duplicados" value={number(report.duplicates.length)} helper={bytes(report.hashBytesRead) + ' lidos por hash'} icon={Layers3} tone="pink"/>
+            <Metric label="Arquivos analisados" value={number(report.filesScanned)} helper={number(report.directoriesScanned) + ' diretórios percorridos'} icon={FileSearch} tone="violet"/>
+            <Metric label="Espaço duplicado" value={report.hashingSkipped ? '—' : bytes(report.potentialSavingsBytes)} helper={report.hashingSkipped ? 'BLAKE3 ainda não executado' : 'Estimativa, sem exclusões'} icon={Fingerprint} tone="mint"/>
+            <Metric label="Grupos duplicados" value={report.hashingSkipped ? '—' : number(report.duplicates.length)} helper={report.hashingSkipped ? 'Ative o modo completo' : bytes(report.hashBytesRead) + ' lidos por hash'} icon={Layers3} tone="pink"/>
           </div>
           <div className="dashboard-grid">
             <section className="panel glass">
@@ -323,12 +449,59 @@ export default function App() {
           <section className="panel glass wide-panel"><SectionHeading kicker="OPORTUNIDADES" title="Arquivos que mais ocupam espaço" right={<button className="text-button" onClick={() => selectSection('explorer')}>Explorar arquivos <ArrowRight size={16}/></button>}/><FileRows files={report.topFiles.slice(0, 7)} copy={copy}/></section>
         </>}
 
-        {section === 'explorer' && report && <section className="panel glass full-panel"><SectionHeading kicker="RANKING POR TAMANHO" title="Arquivos grandes" description="Os 300 maiores arquivos encontrados na varredura; exibidos por tamanho lógico." right={<Tag tone="blue">{report.topFiles.length} resultados</Tag>}/><FileRows files={report.topFiles} copy={copy}/></section>}
+        {section === 'explorer' && report && <section className="panel glass full-panel">
+          <SectionHeading kicker="RANKING POR TAMANHO" title="Arquivos grandes"
+            description="Os 300 maiores arquivos encontrados, com identificação de conteúdo offline e redirecionamentos feita apenas pelos metadados."
+            right={<div className="allocation-actions">
+              <Tag tone="blue">{report.topFiles.length} resultados</Tag>
+              <button type="button" className="outline-button" disabled={busy || searchBusy || allocationBusy}
+                onClick={() => void measureAllocated()}>
+                {allocationBusy ? <LoaderCircle size={16} className="spin"/> : <HardDrive size={16}/>}
+                {allocationBusy ? 'Medindo…' : 'Medir espaço em disco'}
+              </button>
+            </div>}/>
+          <div className="storage-filters" role="group" aria-label="Filtrar por disponibilidade de arquivo">
+            {([
+              ['all', 'Todos'],
+              ['offline', 'Remoto / offline'],
+              ['reparse', 'Redirecionados'],
+            ] as const).map(([status, label]) =>
+              <button key={status} type="button" aria-pressed={cloudFilter === status}
+                className={'storage-filter ' + (cloudFilter === status ? 'active' : '')}
+                onClick={() => setCloudFilter(status)}>{status !== 'all' && <CloudOff size={14}/>}
+                {label}</button>
+            )}
+          </div>
+          <p className="panel-note">O filtro atua sobre os 300 maiores arquivos do relatório.
+            O status remoto é inferido por atributos do Windows; não exige download do arquivo.
+            Outros arquivos virtuais podem não apresentar todos esses atributos.</p>
+          {allocationReport && <p className="panel-note">
+            Alocação consultada em {number(allocationReport.measured)} arquivos;
+            {number(allocationReport.skipped)} ignorados e {number(allocationReport.failed)} indisponíveis.
+            {allocationReport.items.filter(item => (item.hardlinkCount ?? 0) > 1).length > 0 &&
+              ' ' + number(allocationReport.items.filter(item => (item.hardlinkCount ?? 0) > 1).length) + ' arquivos possuem hardlinks compartilhados.'}
+            Valores restritos à lista dos 300 maiores — não são o espaço físico total da pasta
+            nem equivalem a espaço recuperável. Hardlinks podem existir fora do escopo;
+            compressão, arquivos esparsos ou armazenamento compartilhado alteram a alocação reportada.
+          </p>}
+          <FileRows files={report.topFiles.filter(file =>
+            cloudFilter === 'all' || file.contentStatus === cloudFilter
+          )} copy={copy} allocations={allocationReport
+            ? Object.fromEntries(allocationReport.items.map(item => [item.path, item]))
+            : undefined}/>
+        </section>}
 
         {section === 'duplicates' && report && <div className="stack-gap">
-          <div className="insight-banner glass"><div className="insight-icon"><Fingerprint size={25}/></div><div><small>DUPLICAÇÃO VERIFICADA</small><strong>{bytes(report.potentialSavingsBytes)} de economia potencial</strong><p>Apenas cópias independentes, com mesmo tamanho e hash BLAKE3 idêntico, aparecem abaixo. Hardlinks foram excluídos das economias estimadas. Nenhum arquivo é removido.</p></div><Tag tone={report.duplicateAnalysisComplete ? 'green' : 'amber'}>{report.duplicateAnalysisComplete ? 'HASH COMPLETO*' : 'HASH PARCIAL'}</Tag></div>
+          {report.hashingSkipped && <div className="alert warning-alert">
+            <Info size={18}/><span>Esta pasta foi analisada no modo rápido (somente metadados).
+              Nenhuma verificação de duplicados foi executada.</span>
+            <button className="outline-button" type="button" disabled={busy || searchBusy}
+              onClick={() => { setIncludeDuplicates(true); void scanFolder(report.root, regex, minMb, true); }}>
+              Executar BLAKE3</button>
+          </div>}
+          <div className="insight-banner glass"><div className="insight-icon"><Fingerprint size={25}/></div><div><small>DUPLICAÇÃO VERIFICADA</small><strong>{report.hashingSkipped ? 'Aguardando BLAKE3' : bytes(report.potentialSavingsBytes) + ' de economia potencial'}</strong><p>Apenas cópias independentes, com mesmo tamanho e hash BLAKE3 idêntico, aparecem abaixo. Hardlinks foram excluídos das economias estimadas. Nenhum arquivo é removido.</p></div><Tag tone={report.hashingSkipped ? 'amber' : report.duplicateAnalysisComplete ? 'green' : 'amber'}>{report.hashingSkipped ? 'NÃO EXECUTADO' : report.duplicateAnalysisComplete ? 'HASH COMPLETO*' : 'HASH PARCIAL'}</Tag></div>
           <SectionHeading kicker="INSPEÇÃO MANUAL" title="Grupos idênticos" description="Copie os caminhos e revise antes de qualquer intervenção."/>
-          {report.duplicates.length ? report.duplicates.map((group) => <DuplicateCard group={group} key={group.hash} copy={copy}/>) : <div className="empty-list standalone">Nenhum grupo duplicado confirmado dentro do orçamento de hash.</div>}
+          {report.duplicates.length ? report.duplicates.map((group) => <DuplicateCard group={group} key={group.hash} copy={copy}/>) : <div className="empty-list standalone">{report.hashingSkipped ? 'A análise BLAKE3 ainda não foi solicitada.' : 'Nenhum grupo duplicado confirmado dentro do orçamento de hash.'}</div>}
           <p className="subnote">* Completo dentro do escopo analisado, sujeito a erros de leitura, limite de arquivos e links físicos.</p>
         </div>}
 
@@ -342,7 +515,7 @@ export default function App() {
             </form>
             <p className="panel-note"><LockKeyhole size={14}/> Busca somente por metadados: não abre conteúdo, não recalcula hashes e preserva o relatório de duplicados. Regex usa a sintaxe do Rust regex.</p>
           </section>
-          {searchResult && (searchResult.truncated || searchResult.errors > 0) && <div className="alert warning-alert"><Info size={18}/><span>Busca parcial: {searchResult.truncated ? 'limite de arquivos atingido. ' : ''}{searchResult.errors > 0 ? number(searchResult.errors) + ' entradas inacessíveis.' : ''}</span></div>}
+          {searchResult && (searchResult.truncated || searchResult.errors > 0) && <div className="alert warning-alert"><Info size={18}/><span>Busca parcial: {searchResult.truncated ? 'limite explícito de amostragem atingido. ' : ''}{searchResult.errors > 0 ? number(searchResult.errors) + ' entradas inacessíveis.' : ''}</span></div>}
           <section className="panel glass"><SectionHeading kicker="RESULTADOS DE PESQUISA" title={number(searchResult?.totalMatches ?? report.totalMatches) + ' arquivos encontrados'} description="Exibindo até 500 resultados, em ordem decrescente de tamanho."/><FileRows files={searchResult?.matches ?? report.matches} copy={copy}/></section>
         </div>}
 
