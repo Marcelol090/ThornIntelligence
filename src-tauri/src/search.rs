@@ -32,8 +32,13 @@ pub fn search(request: SearchRequest) -> Result<SearchReport, String> {
         .map_err(|e| format!("Pasta inacessível: {e}"))?;
     if !root.is_dir() { return Err("Selecione uma pasta.".into()); }
     let regex = request.regex.as_deref().map(str::trim).filter(|s| !s.is_empty())
-        .map(|p| RegexBuilder::new(p).case_insensitive(true).size_limit(4 * 1024 * 1024)
-            .build().map_err(|e| format!("Regex inválida: {e}"))).transpose()?;
+        .map(|p| {
+            if p.len() > 4096 {
+                return Err("Regex excede o limite de 4096 bytes.".to_owned());
+            }
+            RegexBuilder::new(p).case_insensitive(true).size_limit(4 * 1024 * 1024)
+                .build().map_err(|e| format!("Regex inválida: {e}"))
+        }).transpose()?;
     let max_files = request.max_files.unwrap_or(250_000).clamp(1, 1_000_000);
     let min_size = request.min_size_bytes.unwrap_or(0);
     let mut top = BTreeMap::<(u64, String), FileResult>::new();
@@ -102,6 +107,12 @@ mod tests {
             max_files: None,
         };
         assert!(search(req).is_err());
+        assert!(search(SearchRequest {
+            root: dir.path().display().to_string(),
+            regex: Some("a".repeat(4097)),
+            min_size_bytes: None,
+            max_files: None,
+        }).is_err());
         let report = search(SearchRequest {
             root: dir.path().display().to_string(),
             regex: None,
