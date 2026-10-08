@@ -19,5 +19,5 @@
       "backgroundColor": "#080d1a"
     }]
   },
-  "bundle": { "active": false }
+  "bundle": { "active": false, "icon": ["icons/icon.ico"] }
 }

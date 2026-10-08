@@ -117,11 +117,15 @@ export default function App() {
 
   async function runOptimization(execute: boolean) {
     setError('');
-    setOptimization(null);
     if (execute && !confirmOptimize) {
       setError('Confirme que entende o impacto antes de iniciar a otimização.');
       return;
     }
+    if (execute && (!optimization || optimization.executed || optimization.drive !== drive.trim().replace(':', '').toUpperCase())) {
+      setError('Analise esta unidade com sucesso antes de iniciar a otimização.');
+      return;
+    }
+    setOptimization(null);
     setOptimizing(true);
     try {
       const result = await invoke<OptimizationResult>('optimize_volume', { drive, execute });
@@ -233,7 +237,7 @@ export default function App() {
           <section className="panel glass optimize-panel"><SectionHeading kicker="ADAPTADOR WINDOWS" title="Analisar ou otimizar unidade" description="Primeiro execute a análise. A otimização exige confirmação explícita e pode exigir privilégios de administrador."/>
             <div className="optimize-controls"><label className="field"><span>Letra da unidade</span><div className="input-wrap drive-input"><Disc3 size={19}/><input maxLength={2} value={drive} onChange={(e) => setDrive(e.target.value.toUpperCase())} aria-label="Letra da unidade"/><strong>:</strong></div></label><button className="outline-button" type="button" disabled={optimizing} onClick={() => void runOptimization(false)}>{optimizing ? <LoaderCircle className="spin" size={17}/> : <Activity size={17}/>} Analisar volume</button></div>
             <label className="confirm-box"><input type="checkbox" checked={confirmOptimize} onChange={(e) => setConfirmOptimize(e.target.checked)}/><span>Entendo que a otimização modifica a disposição física/lógica de dados do volume e pode exigir administrador. Fiz backup dos dados importantes.</span></label>
-            <button className="primary-button optimize-action" type="button" disabled={optimizing || !confirmOptimize} onClick={() => void runOptimization(true)}><WandSparkles size={18}/> Iniciar otimização pelo Windows <ArrowRight size={17}/></button>
+            <button className="primary-button optimize-action" type="button" disabled={optimizing || !confirmOptimize || !optimization || optimization.executed || optimization.drive !== drive.trim().replace(':', '').toUpperCase()} onClick={() => void runOptimization(true)}><WandSparkles size={18}/> Iniciar otimização pelo Windows <ArrowRight size={17}/></button>
             {optimization && <div className="command-output"><strong><Check size={17}/> {optimization.executed ? 'Otimização solicitada' : 'Análise concluída'} — unidade {optimization.drive}:</strong><pre>{optimization.output}</pre></div>}
           </section>
           <div className="safety-grid"><div className="safety-card glass"><ShieldCheck size={21}/><strong>Sem alteração automática</strong><p>Nenhuma execução é disparada pela análise de arquivos.</p></div><div className="safety-card glass"><LockKeyhole size={21}/><strong>Sem privilégios ocultos</strong><p>O sistema não contorna permissões do Windows.</p></div><div className="safety-card glass"><Info size={21}/><strong>Limites da versão</strong><p>O adaptador de otimização está disponível apenas no Windows.</p></div></div>
