@@ -107,3 +107,40 @@ Sem benchmark antes/depois, não afirmar superioridade numérica.
 - O scanner e a pesquisa têm limite de tamanho de Regex no backend (4.096 bytes), compilação com tamanho máximo de programa Regex e contagem explícita de correspondências.
 - O scanner mantém apenas 500 correspondências de busca em memória; o inventário de arquivos da varredura completa continua em memória e será substituído por indexação persistente em fase posterior.
 - O build local e CI Windows devem passar antes de afirmar homologação; a conta GitHub Actions pode impedir a inicialização dos jobs por condição de faturamento.
+
+## Execução cooperativa e progresso (rodada seguinte)
+
+```text
+UI jobId (UUID) + Channel<ScanProgress>
+   -> scan_path/search_path
+      -> ScanJobs.start(jobId): rejeita segunda operação
+      -> spawn_blocking(scanner)
+         -> progress fase/contadores (máximo ~4/s em varredura)
+         -> AtomicBool.load() no loop de diretórios
+         -> AtomicBool.load() a cada bloco BLAKE3 (64 KiB)
+         -> AtomicBool.load() na inspeção de identidade
+      -> ScanJobs.finish(jobId) mesmo após erro/JoinError
+   -> cancel_scan(jobId): altera token de operação correspondente
+```
+
+Invariantes:
+- Nunca reutilizar um `AtomicBool` global resetável; evita que uma nova operação ressuscite a varredura cancelada.
+- O frontend mantém resultados anteriores após cancelamento; relatórios parciais não são apresentados como medições concluídas.
+- Nenhum conteúdo/caminho de arquivo é transmitido no progresso: apenas fase e contadores agregados.
+- O cancelamento é cooperativo, não instantâneo, especialmente durante chamadas de I/O do sistema.
+- Nenhuma operação de otimização de disco se beneficia de cancelamento deste scanner: sua autorização permanece separada.
+- Percentuais e estimativas de tempo não são exibidos sem total conhecido.
+- A execução Rust e os testes de integração Windows permanecem obrigatórios antes do lançamento.
+
+Referências pesquisadas via Exa:
+- [Tauri 2 Channel](https://docs.rs/tauri/latest/tauri/ipc/struct.Channel.html) para progresso tipado direto por operação.
+- [AssetHoard — 120 mil arquivos em Tauri](https://assethoard.com/blog/when-120000-files-meet-tauri): evitar grandes transferências IPC, progredir por eventos pequenos e não reinicializar flags globais durante cancelamento.
+- [Microsoft Optimize-Volume](https://learn.microsoft.com/en-us/powershell/module/storage/optimize-volume?view=windowsserver2025-ps): HDD e SSD requerem manutenção diferente.
+
+### Próximo trabalho — índice SQLite, sem atalhos inseguros
+
+- SQLite WAL versionado; schema com `volume_id`, `file_id`, caminho normalizado, tamanho, mtime com resolução de nanossegundos, atributos offline/reparse e digest BLAKE3 opcional.
+- O cache jamais deve assumir que apenas `mtime` garante identidade do conteúdo: validar file-id, tamanho, atributos e uma política explícita de rehash para alterações não observadas.
+- Nunca hidratar arquivos em nuvem para preencher índices; deixar digest como `NULL` e apresentar a razão.
+- Single writer, transações por lote e recuperação após cancelamento/crash. Cada snapshot completo deve ser marcado concluído ou incompleto.
+- Quarentena reversível vem depois: manifesto auditável, confirmação explícita, restauração e exclusão permanente isolada.

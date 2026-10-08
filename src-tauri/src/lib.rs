@@ -1,27 +1,62 @@
 mod health;
+mod jobs;
 mod optimize;
 mod scan;
 mod search;
 
 use health::DiskHealth;
+use jobs::ScanJobs;
 use optimize::OptimizationResult;
-use scan::{ScanReport, ScanRequest};
+use scan::{ScanProgress, ScanReport, ScanRequest};
 use search::{SearchReport, SearchRequest};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{ipc::Channel, State};
 
 #[tauri::command]
-async fn scan_path(request: ScanRequest) -> Result<ScanReport, String> {
-    tauri::async_runtime::spawn_blocking(move || scan::scan(request))
-        .await
-        .map_err(|err| format!("Falha interna da tarefa de varredura: {err}"))?
+async fn scan_path(
+    request: ScanRequest,
+    job_id: String,
+    on_progress: Channel<ScanProgress>,
+    jobs: State<'_, Arc<ScanJobs>>,
+) -> Result<ScanReport, String> {
+    let jobs = Arc::clone(jobs.inner());
+    let token = jobs.start(job_id.clone())?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        scan::scan_with_control(request, token.as_ref(), |event| {
+            let _ = on_progress.send(event);
+        })
+    })
+    .await
+    .map_err(|err| format!("Falha interna da tarefa de varredura: {err}"))
+    .and_then(|result| result);
+    jobs.finish(&job_id);
+    result
 }
 
 #[tauri::command]
-async fn search_path(request: SearchRequest) -> Result<SearchReport, String> {
-    tauri::async_runtime::spawn_blocking(move || search::search(request))
-        .await
-        .map_err(|err| format!("Falha interna da busca por metadados: {err}"))?
+async fn search_path(
+    request: SearchRequest,
+    job_id: String,
+    on_progress: Channel<ScanProgress>,
+    jobs: State<'_, Arc<ScanJobs>>,
+) -> Result<SearchReport, String> {
+    let jobs = Arc::clone(jobs.inner());
+    let token = jobs.start(job_id.clone())?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        search::search_with_control(request, token.as_ref(), |event| {
+            let _ = on_progress.send(event);
+        })
+    })
+    .await
+    .map_err(|err| format!("Falha interna da busca por metadados: {err}"))
+    .and_then(|result| result);
+    jobs.finish(&job_id);
+    result
+}
+
+#[tauri::command]
+fn cancel_scan(job_id: String, jobs: State<'_, Arc<ScanJobs>>) -> Result<bool, String> {
+    jobs.cancel(&job_id)
 }
 
 #[tauri::command]
@@ -48,7 +83,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(optimize::OptimizationGate::default()))
-        .invoke_handler(tauri::generate_handler![scan_path, search_path, optimize_volume, disk_health])
+        .manage(Arc::new(ScanJobs::default()))
+        .invoke_handler(tauri::generate_handler![scan_path, search_path, cancel_scan, optimize_volume, disk_health])
         .run(tauri::generate_context!())
         .expect("error while running Thorn Intelligence");
 }

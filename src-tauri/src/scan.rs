@@ -5,9 +5,27 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use same_file::Handle;
 use std::fs::File;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanProgress {
+    pub phase: String,
+    pub files_scanned: usize,
+    pub hash_bytes_read: u64,
+}
+
+fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        Err("Operação cancelada pelo usuário.".into())
+    } else {
+        Ok(())
+    }
+}
 
 const MAX_HASH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_RESULTS: usize = 300;
@@ -141,6 +159,14 @@ fn avoid_content_read(_metadata: &std::fs::Metadata) -> bool {
 /// OS caches and filesystem read-ahead may cause physical device I/O to differ;
 /// this counter deliberately measures successful application-level read bytes.
 fn content_hash(path: &Path, expected_size: u64) -> (std::io::Result<Option<String>>, u64) {
+    content_hash_with_cancel(path, expected_size, &AtomicBool::new(false))
+}
+
+fn content_hash_with_cancel(
+    path: &Path,
+    expected_size: u64,
+    cancel: &AtomicBool,
+) -> (std::io::Result<Option<String>>, u64) {
     let mut bytes_read = 0u64;
     let result = (|| -> std::io::Result<Option<String>> {
         let before = std::fs::symlink_metadata(path)?;
@@ -163,6 +189,12 @@ fn content_hash(path: &Path, expected_size: u64) -> (std::io::Result<Option<Stri
         let mut hasher = Hasher::new();
         let mut buffer = [0u8; 65536];
         while bytes_read < expected_size {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Operação cancelada pelo usuário.",
+                ));
+            }
             // Never read beyond the originally measured size. A file growing
             // concurrently must not consume an unbounded I/O budget.
             let remaining = expected_size - bytes_read;
@@ -213,7 +245,17 @@ fn prepare_regex(pattern: Option<&str>) -> Result<Option<Regex>, String> {
 }
 
 pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
+    scan_with_control(request, &AtomicBool::new(false), |_| {})
+}
+
+pub fn scan_with_control(
+    request: ScanRequest,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(ScanProgress),
+) -> Result<ScanReport, String> {
     let timer = Instant::now();
+    let mut last_update = Instant::now();
+    progress(ScanProgress { phase: "scanning".into(), files_scanned: 0, hash_bytes_read: 0 });
     let root = std::fs::canonicalize(Path::new(&request.root))
         .map_err(|err| format!("Pasta não encontrada ou inacessível: {err}"))?;
     if !root.is_dir() {
@@ -236,6 +278,7 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
 
     directories.insert(root.clone(), DirectorySize::default());
     for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+        check_cancel(cancel)?;
         let entry = match entry {
             Ok(value) => value,
             Err(err) => {
@@ -295,6 +338,14 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
         }
         let hash_eligible = !avoid_content_read(&metadata);
         records.push(FileRecord { path, size, result, hash_eligible });
+        if last_update.elapsed() >= Duration::from_millis(250) {
+            progress(ScanProgress {
+                phase: "scanning".into(),
+                files_scanned: records.len(),
+                hash_bytes_read: 0,
+            });
+            last_update = Instant::now();
+        }
     }
 
     let mut top_files: Vec<FileResult> = records.iter().map(|file| file.result.clone()).collect();
@@ -337,8 +388,14 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
     let mut skipped_content_files = 0_usize;
     let mut duplicate_analysis_complete = true;
     let mut groups = HashMap::<(u64, String), Vec<String>>::new();
+    progress(ScanProgress {
+        phase: "hashing".into(),
+        files_scanned: records.len(),
+        hash_bytes_read: hashed_bytes,
+    });
     for (size, bucket) in candidate_buckets {
         for record in bucket {
+            check_cancel(cancel)?;
             if !record.hash_eligible {
                 skipped_content_files += 1;
                 duplicate_analysis_complete = false;
@@ -348,9 +405,19 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
                 duplicate_analysis_complete = false;
                 continue;
             }
-            let (hash_result, consumed_bytes) = content_hash(&record.path, record.size);
+            let (hash_result, consumed_bytes) =
+                content_hash_with_cancel(&record.path, record.size, cancel);
+            check_cancel(cancel)?;
             // Charge the budget even if hashing fails after a partial read.
             hashed_bytes = hashed_bytes.saturating_add(consumed_bytes);
+            if last_update.elapsed() >= Duration::from_millis(250) {
+                progress(ScanProgress {
+                    phase: "hashing".into(),
+                    files_scanned: records.len(),
+                    hash_bytes_read: hashed_bytes,
+                });
+                last_update = Instant::now();
+            }
             match hash_result {
                 Ok(Some(hash)) => {
                     groups.entry((size, hash)).or_default().push(record.result.path.clone());
@@ -375,7 +442,13 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
 
     let mut hardlink_aliases = 0_usize;
     let mut duplicates = Vec::<DuplicateGroup>::new();
+    progress(ScanProgress {
+        phase: "verifying".into(),
+        files_scanned: records.len(),
+        hash_bytes_read: hashed_bytes,
+    });
     for ((size_bytes, hash), copies) in groups {
+        check_cancel(cancel)?;
         if copies.len() < 2 {
             continue;
         }
@@ -390,6 +463,7 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
         let mut independently_allocated = Vec::<String>::new();
         let mut identity_verified = true;
         for path in copies {
+            check_cancel(cancel)?;
             // Identity inspection also opens a handle; recheck before doing so.
             match std::fs::symlink_metadata(&path) {
                 Ok(meta) if !meta.file_type().is_symlink() && !avoid_content_read(&meta) => {}
@@ -439,6 +513,12 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
         .fold(0_u64, |total, item| total.saturating_add(item.potential_savings_bytes));
     duplicates.truncate(MAX_RESULTS);
 
+    check_cancel(cancel)?;
+    progress(ScanProgress {
+        phase: "complete".into(),
+        files_scanned: records.len(),
+        hash_bytes_read: hashed_bytes,
+    });
     Ok(ScanReport {
         root: root.display().to_string(),
         files_scanned: records.len(),
@@ -466,6 +546,50 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn scan_respects_cancellation_before_reading_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("data"), b"test").unwrap();
+        let token = AtomicBool::new(true);
+        let report = scan_with_control(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: None,
+        }, &token, |_| {});
+        assert!(report.unwrap_err().contains("cancelada"));
+    }
+
+    #[test]
+    fn cancellation_during_hash_stage_drops_partial_report() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a"), vec![1u8; 4096]).unwrap();
+        fs::write(dir.path().join("b"), vec![1u8; 4096]).unwrap();
+        let token = AtomicBool::new(false);
+        let result = scan_with_control(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: None,
+        }, &token, |p| {
+            if p.phase == "hashing" {
+                token.store(true, Ordering::Relaxed);
+            }
+        });
+        assert!(result.unwrap_err().contains("cancelada"));
+    }
+
+    #[test]
+    fn scan_reports_all_phases_without_exposing_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a"), b"same").unwrap();
+        fs::write(dir.path().join("b"), b"same").unwrap();
+        let mut events = Vec::new();
+        let report = scan_with_control(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: None,
+        }, &AtomicBool::new(false), |p| events.push(p));
+        assert_eq!(report.unwrap().files_scanned, 2);
+        assert!(events.iter().any(|p| p.phase == "hashing"));
+        assert_eq!(events.last().unwrap().phase, "complete");
+    }
 
     #[test]
     fn scans_sizes_and_verifies_exact_duplicates() {

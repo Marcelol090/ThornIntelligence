@@ -1,8 +1,9 @@
-use crate::scan::FileResult;
+use crate::scan::{FileResult, ScanProgress};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 #[derive(Debug, Deserialize)]
@@ -27,7 +28,17 @@ pub struct SearchReport {
 }
 
 pub fn search(request: SearchRequest) -> Result<SearchReport, String> {
+    search_with_control(request, &AtomicBool::new(false), |_| {})
+}
+
+pub fn search_with_control(
+    request: SearchRequest,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(ScanProgress),
+) -> Result<SearchReport, String> {
     let started = Instant::now();
+    let mut last_update = Instant::now();
+    progress(ScanProgress { phase: "searching".into(), files_scanned: 0, hash_bytes_read: 0 });
     let root = std::fs::canonicalize(&request.root)
         .map_err(|e| format!("Pasta inacessível: {e}"))?;
     if !root.is_dir() { return Err("Selecione uma pasta.".into()); }
@@ -45,6 +56,9 @@ pub fn search(request: SearchRequest) -> Result<SearchReport, String> {
     let (mut files_scanned, mut total_matches, mut errors) = (0, 0, 0);
     let mut truncated = false;
     for entry in WalkDir::new(&root).follow_links(false) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Operação cancelada pelo usuário.".into());
+        }
         let entry = match entry { Ok(e) => e, Err(_) => { errors += 1; continue; } };
         if !entry.file_type().is_file() { continue; }
         if files_scanned >= max_files { truncated = true; break; }
@@ -52,6 +66,14 @@ pub fn search(request: SearchRequest) -> Result<SearchReport, String> {
             Ok(m) => m, Err(_) => { errors += 1; continue; }
         };
         files_scanned += 1;
+        if last_update.elapsed() >= Duration::from_millis(250) {
+            progress(ScanProgress {
+                phase: "searching".into(),
+                files_scanned,
+                hash_bytes_read: 0,
+            });
+            last_update = Instant::now();
+        }
         let size = metadata.len();
         if size < min_size { continue; }
         let path = entry.path().to_string_lossy().into_owned();
@@ -66,6 +88,14 @@ pub fn search(request: SearchRequest) -> Result<SearchReport, String> {
         });
         if top.len() > 500 { top.pop_first(); }
     }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Operação cancelada pelo usuário.".into());
+    }
+    progress(ScanProgress {
+        phase: "complete".into(),
+        files_scanned,
+        hash_bytes_read: 0,
+    });
     Ok(SearchReport {
         root: root.display().to_string(), files_scanned, total_matches,
         matches: top.into_iter().rev().map(|(_, f)| f).collect(),
@@ -77,6 +107,18 @@ pub fn search(request: SearchRequest) -> Result<SearchReport, String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn search_can_be_cancelled_without_partially_publishing_results() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("sample.bin"), b"data").unwrap();
+        let cancelled = AtomicBool::new(true);
+        let result = search_with_control(SearchRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: None,
+        }, &cancelled, |_| {});
+        assert!(result.unwrap_err().contains("cancelada"));
+    }
 
     #[test]
     fn search_filters_metadata_and_preserves_order() {
