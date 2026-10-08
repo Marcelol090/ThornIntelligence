@@ -8,7 +8,7 @@ import {
   Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
+import type { CompareReport, CompareRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -16,6 +16,7 @@ const links: { id: Section; label: string; icon: IconType }[] = [
   { id: 'overview', label: 'Visão geral', icon: BarChart3 },
   { id: 'explorer', label: 'Explorador', icon: FolderOpen },
   { id: 'duplicates', label: 'Duplicados', icon: Layers3 },
+  { id: 'compare', label: 'Comparar pastas', icon: Fingerprint },
   { id: 'search', label: 'Busca inteligente', icon: FileSearch },
   { id: 'optimize', label: 'Otimização', icon: Gauge },
 ];
@@ -76,6 +77,10 @@ export default function App() {
   const [report, setReport] = useState<ScanReport | null>(null);
   const [searchResult, setSearchResult] = useState<SearchReport | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
+  const [compareBusy, setCompareBusy] = useState(false);
+  const [referenceRoot, setReferenceRoot] = useState('');
+  const [candidateRoot, setCandidateRoot] = useState('');
+  const [comparison, setComparison] = useState<CompareReport | null>(null);
   const activeJob = useRef<string | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [cancelRequested, setCancelRequested] = useState(false);
@@ -98,7 +103,7 @@ export default function App() {
   }
 
   async function scanFolder(root?: string, pattern = regex, min = minMb) {
-    if (activeJob.current || busy || searchBusy) {
+    if (activeJob.current || busy || searchBusy || compareBusy) {
       setError('Já existe uma análise em andamento.');
       return;
     }
@@ -145,7 +150,7 @@ export default function App() {
 
   async function searchMetadata() {
     if (!report) return;
-    if (activeJob.current || busy || searchBusy) {
+    if (activeJob.current || busy || searchBusy || compareBusy) {
       setError('Já existe uma operação em andamento.');
       return;
     }
@@ -182,6 +187,56 @@ export default function App() {
       setScanProgress(null);
       setCancelRequested(false);
       setSearchBusy(false);
+    }
+  }
+
+  async function pickComparisonFolder(kind: 'reference' | 'candidate') {
+    if (busy || searchBusy || compareBusy || activeJob.current) return;
+    setError('');
+    try {
+      const selected = await open({
+        directory: true, multiple: false,
+        title: kind === 'reference' ? 'Escolher pasta mestre (preservar)' : 'Escolher pasta para conferir',
+      });
+      if (typeof selected !== 'string') return;
+      if (kind === 'reference') setReferenceRoot(selected);
+      else setCandidateRoot(selected);
+      setComparison(null);
+    } catch (err) {
+      setError('Não foi possível escolher a pasta: ' + String(err));
+    }
+  }
+
+  async function compareFolders() {
+    if (!referenceRoot || !candidateRoot || activeJob.current || busy || searchBusy || compareBusy) return;
+    setError('');
+    const jobId = crypto.randomUUID();
+    const onProgress = new Channel<ScanProgress>();
+    onProgress.onmessage = (event) => {
+      if (activeJob.current === jobId) setScanProgress(event);
+    };
+    activeJob.current = jobId;
+    setScanProgress(null);
+    setCancelRequested(false);
+    setCompareBusy(true);
+    try {
+      const request: CompareRequest = {
+        referenceRoot, candidateRoot, maxFiles: 250_000,
+      };
+      const result = await invoke<CompareReport>('compare_folders', { request, jobId, onProgress });
+      setComparison(result);
+      setToast('Comparação concluída em ' + duration(result.elapsedMs) +
+        (result.complete ? '.' : ' · resultado parcial.'));
+    } catch (err) {
+      const message = String(err);
+      if (message.includes('cancelada')) {
+        setToast('Comparação cancelada. O relatório anterior foi preservado.');
+      } else setError(message);
+    } finally {
+      if (activeJob.current === jobId) activeJob.current = null;
+      setScanProgress(null);
+      setCancelRequested(false);
+      setCompareBusy(false);
     }
   }
 
@@ -269,17 +324,18 @@ export default function App() {
       <main id="main-content" className="content">
         <div className="hero-heading">
           <div><div className="hero-kicker"><Sparkles size={14}/> ARMAZENAMENTO SOB CONTROLE</div><h1>{links.find((link) => link.id === section)?.label}<span className="heading-period">.</span></h1><p>Descubra o que ocupa espaço, identifique desperdícios e tome decisões com segurança.</p></div>
-          <button className="primary-button" disabled={busy || searchBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
+          <button className="primary-button" disabled={busy || searchBusy || compareBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
         </div>
 
         <div className="scope-strip glass"><div className="scope-icon"><Folder size={19}/></div><div className="scope-details"><small>ESCOPO ATUAL</small><strong title={roots}>{scopeName}</strong></div><span className="scope-full" title={roots}>{scanned ? truncatePath(roots, 56) : 'Escolha uma pasta ou unidade para iniciar'}</span><Tag tone={scanned ? 'green' : 'neutral'}>{scanned ? 'ANALISADO' : 'AGUARDANDO'}</Tag></div>
 
-        {(busy || searchBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
+        {(busy || searchBusy || compareBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
           <div className="activity-spinner"><LoaderCircle size={20} className="spin"/></div>
           <div className="activity-details">
             <strong>{scanProgress?.phase === 'hashing' ? 'Verificando duplicados com BLAKE3' :
               scanProgress?.phase === 'verifying' ? 'Conferindo identidades físicas' :
-              scanProgress?.phase === 'searching' ? 'Pesquisando metadados' : 'Analisando diretórios'}</strong>
+              scanProgress?.phase === 'searching' ? 'Pesquisando metadados' :
+              scanProgress?.phase === 'comparing' ? 'Inventariando as duas pastas' : 'Analisando diretórios'}</strong>
             <small>{number(scanProgress?.filesScanned ?? 0)} arquivos processados
               {scanProgress && scanProgress.hashBytesRead > 0 ? ' · ' + bytes(scanProgress.hashBytesRead) + ' lidos por hash' : ''}
             </small>
@@ -294,7 +350,7 @@ export default function App() {
         {toast && <div role="status" className="alert toast-alert"><Check size={17}/><span>{toast}</span><button aria-label="Fechar mensagem" className="icon-button" onClick={() => setToast('')}><X size={16}/></button></div>}
         {report && (report.truncated || report.errors > 0 || !report.duplicateAnalysisComplete || report.hardlinkAliases > 0 || report.skippedContentFiles > 0) && <div className="alert warning-alert"><Info size={18}/><span>{report.truncated ? 'Limite de 250.000 arquivos atingido; o relatório é parcial. ' : ''}{report.errors > 0 ? number(report.errors) + ' entradas não puderam ser processadas. ' : ''}{!report.duplicateAnalysisComplete ? 'Análise de duplicados incompleta (limite de leitura, arquivos indisponíveis ou modificados); pode haver mais cópias. ' : ''}{report.hardlinkAliases > 0 ? number(report.hardlinkAliases) + ' links físicos compartilhados foram excluídos das estimativas. ' : ''}{report.skippedContentFiles > 0 ? number(report.skippedContentFiles) + ' arquivos de conteúdo remoto/offline ou reparse foram ignorados no hash para evitar downloads involuntários. ' : ''}As estimativas não equivalem a espaço liberado.</span></div>}
 
-        {!scanned && section !== 'optimize' && <div className="onboarding glass">
+        {!scanned && section !== 'optimize' && section !== 'compare' && <div className="onboarding glass">
           <div className="onboarding-content"><Tag tone="blue"><Sparkles size={13}/> INTELLIGENT STORAGE</Tag><h2>Encontre espaço que você nem sabia que tinha.</h2><p>Mapeie arquivos, compare tamanhos, descubra duplicados reais com BLAKE3 e pesquise nomes ou caminhos usando expressões regulares. Tudo acontece no seu computador.</p><button className="primary-button" disabled={busy} onClick={() => void scanFolder()}><FolderOpen size={18}/> Escolher pasta <ArrowRight size={17}/></button></div>
           <div className="onboarding-visual"><div className="orb orb-one"/><div className="orb orb-two"/><div className="preview-card preview-main"><div className="preview-dotline"><i/><i/><i/></div><div className="preview-chart"><div/><div/><div/><div/><div/><div/><div/></div><div className="preview-baseline"/></div><div className="preview-card preview-small"><Fingerprint size={21}/><span>BLAKE3</span><CheckCircle2 size={17}/></div></div>
         </div>}
@@ -330,6 +386,101 @@ export default function App() {
           <SectionHeading kicker="INSPEÇÃO MANUAL" title="Grupos idênticos" description="Copie os caminhos e revise antes de qualquer intervenção."/>
           {report.duplicates.length ? report.duplicates.map((group) => <DuplicateCard group={group} key={group.hash} copy={copy}/>) : <div className="empty-list standalone">Nenhum grupo duplicado confirmado dentro do orçamento de hash.</div>}
           <p className="subnote">* Completo dentro do escopo analisado, sujeito a erros de leitura, limite de arquivos e links físicos.</p>
+        </div>}
+
+        {section === 'compare' && <div className="stack-gap">
+          <div className="insight-banner glass">
+            <div className="insight-icon"><Fingerprint size={25}/></div>
+            <div>
+              <small>COMPARAÇÃO MESTRE → CANDIDATA</small>
+              <strong>Encontre cópias sem mexer no acervo original.</strong>
+              <p>Selecione duas pastas independentes. O Thorn compara primeiro os tamanhos, depois confirma o conteúdo
+                com BLAKE3 e exclui hardlinks da estimativa. Nunca move ou exclui arquivos nesta tela.</p>
+            </div>
+            <Tag tone="green">SOMENTE LEITURA</Tag>
+          </div>
+          <section className="panel glass">
+            <SectionHeading kicker="ESCOLHA AS PASTAS" title="Comparação orientada por referência"
+              description="Pasta mestre: tudo é preservado. Pasta candidata: somente nela são identificadas cópias existentes na mestre."/>
+            <div className="compare-folder-list">
+              <div className="compare-folder-row">
+                <div className="compare-folder-text">
+                  <strong>Pasta mestre · preservar</strong>
+                  <small title={referenceRoot}>{referenceRoot || 'Selecione o acervo principal'}</small>
+                </div>
+                <button type="button" className="outline-button" disabled={compareBusy || busy || searchBusy}
+                  onClick={() => void pickComparisonFolder('reference')}><FolderOpen size={16}/> Escolher</button>
+              </div>
+              <div className="compare-folder-row">
+                <div className="compare-folder-text">
+                  <strong>Pasta candidata · conferir</strong>
+                  <small title={candidateRoot}>{candidateRoot || 'Selecione a pasta com possíveis cópias'}</small>
+                </div>
+                <button type="button" className="outline-button" disabled={compareBusy || busy || searchBusy}
+                  onClick={() => void pickComparisonFolder('candidate')}><FolderOpen size={16}/> Escolher</button>
+              </div>
+            </div>
+            <button type="button" className="primary-button"
+              disabled={!referenceRoot || !candidateRoot || compareBusy || busy || searchBusy}
+              onClick={() => void compareFolders()}>
+              {compareBusy ? <LoaderCircle className="spin" size={17}/> : <Fingerprint size={17}/>}
+              {compareBusy ? 'Comparando…' : 'Comparar com BLAKE3'}
+            </button>
+            <p className="panel-note"><LockKeyhole size={14}/> Sem exclusão automática.
+              Limites: 250 mil arquivos por pasta, 8 GiB de leituras de hash por comparação e no máximo 300 resultados exibidos.
+              Pastas sobrepostas, arquivos em nuvem e links redirecionados são recusados ou ignorados.</p>
+          </section>
+          {comparison && <>
+            <div className="metrics-grid">
+              <Metric label="Candidatos correspondentes" value={number(comparison.matchedCandidates)}
+                helper="Mesmo tamanho e BLAKE3, identidade independente" icon={Fingerprint} tone="mint"/>
+              <Metric label="Economia lógica potencial" value={bytes(comparison.potentialLogicalSavingsBytes)}
+                helper="Não equivale a espaço físico liberado" icon={HardDrive}/>
+              <Metric label="Arquivos na pasta mestre" value={number(comparison.referenceFiles)}
+                helper="Somente leitura" icon={FolderOpen} tone="violet"/>
+              <Metric label="Leituras de hash" value={bytes(comparison.hashBytesRead)}
+                helper="Limite de até 8 GiB" icon={Gauge} tone="pink"/>
+            </div>
+            {!comparison.complete && <div className="alert warning-alert" role="status">
+              <Info size={18}/><span>A comparação é parcial.
+                {comparison.truncated ? ' Limite de arquivos atingido.' : ''}
+                {comparison.errors > 0 ? ' Erros de leitura ou de identidade: ' + number(comparison.errors) + '.' : ''}
+                {comparison.skippedCloudFiles > 0 ?
+                  ' Entradas em nuvem, links ou redirecionamentos ignorados: ' + number(comparison.skippedCloudFiles) + '.' : ''}
+                Resultados ausentes não provam que um arquivo é único.</span>
+            </div>}
+            {comparison.hardlinkAliases > 0 && <p className="panel-note">
+              <Info size={14}/> {number(comparison.hardlinkAliases)} hardlinks/aliases ignorados para evitar contar espaço duas vezes.
+            </p>}
+            <section className="panel glass">
+              <SectionHeading kicker="REVISÃO MANUAL" title={number(comparison.matchedCandidates) + ' candidatos confirmados'}
+                description="Compare os caminhos; nenhuma ação de exclusão está disponível aqui."
+                right={<Tag tone={comparison.complete ? 'green' : 'amber'}>
+                  {comparison.complete ? 'ANÁLISE CONCLUÍDA' : 'PARCIAL'}</Tag>}/>
+              {comparison.matches.length === 0 && <div className="empty-list">
+                Nenhuma cópia independente confirmada dentro dos limites da análise.
+              </div>}
+              {comparison.matches.map(item => <div className="compare-result" key={item.candidatePath}>
+                <div className="compare-result-top"><strong>{bytes(item.sizeBytes)}</strong>
+                  <small>BLAKE3 {item.hash.slice(0, 16)}…</small></div>
+                <div className="compare-result-path"><span>Candidata</span>
+                  <code title={item.candidatePath}>{item.candidatePath}</code>
+                  <button type="button" className="icon-button" title="Copiar candidato"
+                    aria-label="Copiar caminho do candidato" onClick={() => void copy(item.candidatePath)}>
+                    <Clipboard size={15}/></button></div>
+                <div className="compare-result-path"><span>Mestre</span>
+                  <code title={item.referencePath}>{item.referencePath}</code>
+                  <button type="button" className="icon-button" title="Copiar referência"
+                    aria-label="Copiar caminho da referência" onClick={() => void copy(item.referencePath)}>
+                    <Clipboard size={15}/></button></div>
+              </div>)}
+              {comparison.matchedCandidates > comparison.matches.length && <p className="panel-note">
+                Exibindo os primeiros 300 caminhos confirmados; o contador considera todos os candidatos encontrados.
+              </p>}
+              <p className="panel-note">Relatório instantâneo de arquivos locais. Eles podem mudar após a análise.
+                Antes de qualquer limpeza, faça backup e confirme novamente a identidade do arquivo.</p>
+            </section>
+          </>}
         </div>}
 
         {section === 'search' && report && <div className="stack-gap">

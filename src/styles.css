@@ -239,3 +239,19 @@ small{font-size:12px}
 .activity-details small{font-size:11px;color:#8fa4bd}
 .scan-activity .outline-button{min-height:36px}
 @media(max-width:570px){.scan-activity{flex-wrap:wrap}.scan-activity .outline-button{width:100%}}
+
+/* Reference → candidate duplicate review: paths stay fully inspectable. */
+.compare-folder-list{display:grid;gap:12px;margin:16px 0}
+.compare-folder-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 16px;border:1px solid rgba(139,182,226,.20);border-radius:12px;background:rgba(35,56,82,.24)}
+.compare-folder-text{min-width:0;display:grid;gap:7px}
+.compare-folder-text strong{font-size:12px}
+.compare-folder-text small{font-size:11px;color:#a4b8cc;overflow-wrap:anywhere}
+.compare-folder-row .outline-button{flex-shrink:0;display:flex;align-items:center;gap:8px}
+.compare-result{display:grid;gap:12px;padding:17px 3px;border-bottom:1px solid rgba(158,185,213,.13)}
+.compare-result-top{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.compare-result-top strong{font-size:14px}
+.compare-result-top small{font-size:11px;color:#9ab1c8}
+.compare-result-path{display:grid;grid-template-columns:72px minmax(0,1fr) 32px;align-items:center;gap:8px}
+.compare-result-path span{font-size:11px;color:#9badbf}
+.compare-result-path code{font-size:11px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;min-width:0;color:#c8d8e9}
+@media(max-width:600px){.compare-folder-row{align-items:stretch;flex-direction:column}.compare-folder-row .outline-button{justify-content:center}.compare-result-path{grid-template-columns:1fr 32px;gap:5px}.compare-result-path span{grid-column:1/-1}}

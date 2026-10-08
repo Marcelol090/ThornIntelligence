@@ -94,11 +94,41 @@ export interface OptimizationResult {
   output: string;
 }
 
-export type Section = 'overview' | 'explorer' | 'duplicates' | 'search' | 'optimize';
+export type Section = 'overview' | 'explorer' | 'duplicates' | 'search' | 'optimize' | 'compare';
 
 /** Lightweight IPC progress; no per-file paths or file contents are sent. */
 export interface ScanProgress {
-  phase: 'scanning' | 'hashing' | 'verifying' | 'searching' | 'complete';
+  phase: 'scanning' | 'comparing' | 'hashing' | 'verifying' | 'searching' | 'complete';
   filesScanned: number;
   hashBytesRead: number;
+}
+
+/** Comparison never deletes or moves files; its savings are logical estimates. */
+export interface CompareRequest {
+  referenceRoot: string;
+  candidateRoot: string;
+  maxFiles: number;
+}
+export interface CompareMatch {
+  candidatePath: string;
+  referencePath: string;
+  sizeBytes: number;
+  hash: string;
+}
+export interface CompareReport {
+  referenceRoot: string;
+  candidateRoot: string;
+  referenceFiles: number;
+  candidateFiles: number;
+  matchedCandidates: number;
+  matches: CompareMatch[];
+  potentialLogicalSavingsBytes: number;
+  hashBytesRead: number;
+  skippedCloudFiles: number;
+  hardlinkAliases: number;
+  errors: number;
+  errorSamples: string[];
+  truncated: boolean;
+  complete: boolean;
+  elapsedMs: number;
 }

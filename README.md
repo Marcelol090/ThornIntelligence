@@ -91,3 +91,20 @@ npm run tauri dev
 **Bloqueio conhecido:** o GitHub Actions vinha falhando antes de iniciar os jobs. O código desta melhoria precisa passar por esses comandos em Windows antes de uma homologação. O app não executa exclusão automática ou desfragmentação autônoma.
 
 Fontes: [Tauri 2 Channels](https://docs.rs/tauri/latest/tauri/ipc/struct.Channel.html), [Tauri Calling Frontend](https://v2.tauri.app/develop/calling-frontend/), [AssetHoard: lições de IPC em 120.000 arquivos](https://assethoard.com/blog/when-120000-files-meet-tauri).
+
+## Comparação de duas pastas — Duplicate Decision Engine
+
+A seção **Comparar pastas** funciona mesmo sem uma varredura global prévia:
+
+1. Selecione a **pasta mestre**, cujo conteúdo será apenas consultado.
+2. Selecione uma **pasta candidata** separada, que contém possíveis cópias.
+3. Execute a comparação. O Rust inventaria as duas pastas e limita a leitura de BLAKE3 aos tamanhos compartilhados entre elas.
+4. Inspecione os resultados: cada item confirma hash BLAKE3 e mostra o caminho da cópia candidata e da referência. É possível copiar caminhos para análise manual, mas **não há botão de exclusão**.
+
+Proteções: recusa pastas sobrepostas, ignora caminhos cloud-only/offline/reparse e arquivos vazios, verifica tamanho e mtime durante hashing e compara identidade física para não contar hardlinks como cópias independentes. Resultados de varreduras com erros/limites são identificados como **parciais**. Uma execução suporta no máximo 250 mil arquivos por pasta, 8 GiB de bytes lidos por hash e exibe os 300 maiores matches. A economia apresentada é apenas **lógica potencial**, não quantidade garantida de bytes físicos recuperáveis.
+
+A implementação inclui testes para múltiplas cópias, arquivos com conteúdo diferente e tamanho igual, aliases entre pastas, alias com outra referência independente, cancelamento antes/durante o hash e pastas sobrepostas. Não foi implementada movimentação para quarentena por esta tela; a futura associação com a quarentena exige uma nova aprovação e revalidação antes de qualquer mutação.
+
+Referências: [same-file Handle](https://docs.rs/same-file/latest/same_file/struct.Handle.html), [atributos de arquivos no Windows](https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants), [dupeGuru — hardlinks entre sistemas de arquivos](https://github.com/arsenetar/dupeguru/issues/1388).
+
+**Validação de release:** `npm run build`, `cargo test --manifest-path src-tauri/Cargo.toml`, `cargo check --manifest-path src-tauri/Cargo.toml`; repetir em NTFS local, OneDrive Files On-Demand e volumes diferentes com arquivos de teste. Os jobs GitHub Actions precisam iniciar antes de afirmar que o aplicativo foi homologado.
