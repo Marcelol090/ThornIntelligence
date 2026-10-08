@@ -153,7 +153,7 @@ export default function App() {
     try {
       const parsed = Number(min);
       if (!Number.isFinite(parsed) || parsed < 0) throw new Error('Tamanho mínimo inválido.');
-      const request: ScanRequest = { root: path, regex: pattern.trim() || null, minSizeBytes: Math.floor(parsed * 1024 * 1024), maxFiles: 250_000, analyzeDuplicates: analyze };
+      const request: ScanRequest = { root: path, regex: pattern.trim() || null, minSizeBytes: Math.floor(parsed * 1024 * 1024), analyzeDuplicates: analyze };
       const result = await invoke<ScanReport>('scan_path', { request, jobId, onProgress });
       setReport(result);
       setSearchResult(null);
@@ -195,8 +195,7 @@ export default function App() {
         root: report.root,
         regex: regex.trim() || null,
         minSizeBytes: Math.floor(parsed * 1048576),
-        maxFiles: 250_000,
-      };
+       };
       const result = await invoke<SearchReport>('search_path', { request, jobId, onProgress });
       setSearchResult(result);
       setToast('Busca por metadados concluída em ' + duration(result.elapsedMs) + '.');
@@ -333,7 +332,7 @@ export default function App() {
         </div>}
         {error && <div role="alert" className="alert error-alert"><AlertCircle size={19}/><span>{error}</span><button aria-label="Fechar aviso" className="icon-button" onClick={() => setError('')}><X size={16}/></button></div>}
         {toast && <div role="status" className="alert toast-alert"><Check size={17}/><span>{toast}</span><button aria-label="Fechar mensagem" className="icon-button" onClick={() => setToast('')}><X size={16}/></button></div>}
-        {report && (report.truncated || report.errors > 0 || !report.duplicateAnalysisComplete || report.hardlinkAliases > 0 || report.skippedContentFiles > 0) && <div className="alert warning-alert"><Info size={18}/><span>{report.truncated ? 'Limite de 250.000 arquivos atingido; o relatório é parcial. ' : ''}{report.errors > 0 ? number(report.errors) + ' entradas não puderam ser processadas. ' : ''}{report.hashingSkipped ? 'Modo rápido: BLAKE3 não executado. Ative a análise para verificar cópias. ' :
+        {report && (report.truncated || report.errors > 0 || !report.duplicateAnalysisComplete || report.hardlinkAliases > 0 || report.skippedContentFiles > 0) && <div className="alert warning-alert"><Info size={18}/><span>{report.truncated ? 'Amostragem solicitada: limite explícito de arquivos atingido; o relatório é parcial. ' : ''}{report.errors > 0 ? number(report.errors) + ' entradas não puderam ser processadas. ' : ''}{report.hashingSkipped ? 'Modo rápido: BLAKE3 não executado. Ative a análise para verificar cópias. ' :
             !report.duplicateAnalysisComplete ? 'Análise de duplicados incompleta (limite de leitura ou arquivos indisponíveis); pode haver mais cópias. ' : ''}{report.hardlinkAliases > 0 ? number(report.hardlinkAliases) + ' links físicos compartilhados foram excluídos das estimativas. ' : ''}{report.skippedContentFiles > 0 ? number(report.skippedContentFiles) + ' arquivos de conteúdo remoto/offline ou reparse foram ignorados no hash para evitar downloads involuntários. ' : ''}As estimativas não equivalem a espaço liberado.</span></div>}
 
         {!scanned && section !== 'optimize' && <div className="onboarding glass">
@@ -344,7 +343,7 @@ export default function App() {
         {section === 'overview' && report && <>
           <div className="metrics-grid">
             <Metric label="Volume analisado" value={bytes(report.logicalBytes)} helper="Tamanho lógico dos arquivos" icon={Database}/>
-            <Metric label="Arquivos indexados" value={number(report.filesScanned)} helper={number(report.directoriesScanned) + ' diretórios percorridos'} icon={FileSearch} tone="violet"/>
+            <Metric label="Arquivos analisados" value={number(report.filesScanned)} helper={number(report.directoriesScanned) + ' diretórios percorridos'} icon={FileSearch} tone="violet"/>
             <Metric label="Espaço duplicado" value={report.hashingSkipped ? '—' : bytes(report.potentialSavingsBytes)} helper={report.hashingSkipped ? 'BLAKE3 ainda não executado' : 'Estimativa, sem exclusões'} icon={Fingerprint} tone="mint"/>
             <Metric label="Grupos duplicados" value={report.hashingSkipped ? '—' : number(report.duplicates.length)} helper={report.hashingSkipped ? 'Ative o modo completo' : bytes(report.hashBytesRead) + ' lidos por hash'} icon={Layers3} tone="pink"/>
           </div>
@@ -413,7 +412,7 @@ export default function App() {
             </form>
             <p className="panel-note"><LockKeyhole size={14}/> Busca somente por metadados: não abre conteúdo, não recalcula hashes e preserva o relatório de duplicados. Regex usa a sintaxe do Rust regex.</p>
           </section>
-          {searchResult && (searchResult.truncated || searchResult.errors > 0) && <div className="alert warning-alert"><Info size={18}/><span>Busca parcial: {searchResult.truncated ? 'limite de arquivos atingido. ' : ''}{searchResult.errors > 0 ? number(searchResult.errors) + ' entradas inacessíveis.' : ''}</span></div>}
+          {searchResult && (searchResult.truncated || searchResult.errors > 0) && <div className="alert warning-alert"><Info size={18}/><span>Busca parcial: {searchResult.truncated ? 'limite explícito de amostragem atingido. ' : ''}{searchResult.errors > 0 ? number(searchResult.errors) + ' entradas inacessíveis.' : ''}</span></div>}
           <section className="panel glass"><SectionHeading kicker="RESULTADOS DE PESQUISA" title={number(searchResult?.totalMatches ?? report.totalMatches) + ' arquivos encontrados'} description="Exibindo até 500 resultados, em ordem decrescente de tamanho."/><FileRows files={searchResult?.matches ?? report.matches} copy={copy}/></section>
         </div>}
 

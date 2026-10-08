@@ -43,7 +43,7 @@ A análise de volumes está separada da pesquisa por metadados. O backend exige 
 
 ### Limites operacionais iniciais
 
-- Até **250.000 arquivos** por varredura da interface (núcleo aceita até 1 milhão); o resultado marca explicitamente truncamento.
+- **Sem teto artificial de arquivos** nas análises normais: a enumeração continua até percorrer todos os arquivos acessíveis. `maxFiles` é opcional e só causa truncamento quando solicitado explicitamente. A interface guarda apenas os 300 maiores arquivos e os 500 maiores matches de pesquisa, sem deixar de contabilizar os restantes.
 - Orçamento de até **8 GiB de bytes retornados por leituras de conteúdo** para hashing de candidatos duplicados, incluindo tentativas que falhem após leituras parciais. Isso não equivale ao número exato de bytes físicos lidos pelo dispositivo (cache e read-ahead do SO). Fora desse orçamento, o relatório avisa que pode haver mais cópias.
 - Exibe até 300 maiores arquivos, 300 diretórios, 300 grupos duplicados e 500 correspondências de busca.
 - Leitura direta local, sem indexação persistente nesta versão; pesquisas executam uma nova **enumeração de metadados**, sem refazer hashes BLAKE3, e preservam o relatório de duplicados.
@@ -129,3 +129,16 @@ Agora a tela principal começa com **Incluir BLAKE3 desativado**, acelerando o i
 Ao ativar a opção ou clicar **Executar BLAKE3** na aba de Duplicados, o scanner aplica amostragem de 16 KiB, BLAKE3 completo nos candidatos coincidentes e validação de hardlinks. A configuração é por execução; nenhuma exclusão é feita.
 
 A mudança mantém compatibilidade de API: callers antigos sem `analyzeDuplicates` usam análise completa. O novo frontend solicita explicitamente `analyzeDuplicates: false` por padrão. O teste `metadata_only_mode_skips_content_hash_and_marks_duplicate_metrics_unknown` valida a ausência de leituras de hash e a distinção entre resultados não medidos e zero.
+
+## Correção do limite de 250 mil arquivos (08/10/2026)
+
+O limite era imposto em **dois lugares**: `maxFiles: 250_000` nas chamadas React e `unwrap_or(250_000).clamp(1, 1_000_000)` nos comandos Rust.
+
+- Nas varreduras normais `maxFiles` é omitido. O Rust interpreta `None` como **sem limite numérico de arquivos** e percorre os diretórios acessíveis, inclusive além de 250.000.
+- Na **análise rápida**, o scanner não guarda mais uma cópia de todos os caminhos/metadados para hashing: mantém contadores, distribuição por extensão e diretório, além dos rankings limitados a 300 arquivos e 500 correspondências. Consumo de memória cresce ainda com a quantidade de diretórios e tipos, mas não com um vetor de cada arquivo.
+- Na **análise completa** com BLAKE3, caminhos elegíveis precisam ficar em memória para as etapas de amostragem/hash. Por isso esse modo continua mais caro em RAM e I/O e não foi substituído por uma promessa irrealista de memória constante. O próximo passo é implementar um spool/indexação persistente de candidatos.
+- A busca Regex também percorre todo o escopo sem um limite de arquivos oculto; 500 é somente o limite visual de resultados.
+- Caso a API receba `maxFiles: N` explicitamente, ela mantém a possibilidade de amostragem e sinaliza `truncated: true` ao encontrar arquivos além de N. O valor zero é rejeitado.
+- Erros de acesso e diretórios virtuais/reparse continuam sendo relatados separadamente. A ausência de um teto não significa acesso universal a arquivos protegidos.
+
+Testes unitários cobrem enumeração rápida completa com ranking limitado, limite explícito e rejeição de zero, além de busca sem truncamento com mais de 500 matches. Validar com >250.000 arquivos reais no Windows após compilar e rodar o Rust/TypeScript.

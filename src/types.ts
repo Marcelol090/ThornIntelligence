@@ -53,7 +53,8 @@ export interface ScanRequest {
   root: string;
   regex: string | null;
   minSizeBytes: number;
-  maxFiles: number;
+  /** Omit to scan every accessible file; set only for explicit sampling. */
+  maxFiles?: number;
   analyzeDuplicates?: boolean;
 }
 
@@ -61,7 +62,8 @@ export interface SearchRequest {
   root: string;
   regex: string | null;
   minSizeBytes: number;
-  maxFiles: number;
+  /** Omit to scan every accessible file; set only for explicit sampling. */
+  maxFiles?: number;
 }
 
 export interface SearchReport {

@@ -41,6 +41,7 @@ pub struct ScanRequest {
     pub root: String,
     pub regex: Option<String>,
     pub min_size_bytes: Option<u64>,
+    /// Optional explicit sampling limit; None scans every accessible file.
     pub max_files: Option<usize>,
     /// Defaults to true for older callers. Frontend now defaults to quick metadata scan.
     #[serde(default)]
@@ -114,7 +115,6 @@ pub struct ScanReport {
 struct FileRecord {
     path: PathBuf,
     size: u64,
-    result: FileResult,
     hash_eligible: bool,
 }
 
@@ -346,8 +346,18 @@ pub fn scan_with_control(
     }
     let pattern = prepare_regex(request.regex.as_deref())?;
     let min_size = request.min_size_bytes.unwrap_or(0);
-    let max_files = request.max_files.unwrap_or(250_000).clamp(1, 1_000_000);
+    // None means a complete traversal. A cap is only applied when the caller
+    // explicitly requests a sample; it is not a hidden product limitation.
+    if request.max_files == Some(0) {
+        return Err("O limite de arquivos deve ser maior que zero.".into());
+    }
+    let max_files = request.max_files;
+    let mut files_scanned = 0usize;
+    // Metadata-only mode must NOT retain every path in RAM. Full BLAKE3 still
+    // needs candidate paths, but keeps only path/size/eligibility (not a cloned
+    // FileResult for every file).
     let mut records = Vec::<FileRecord>::new();
+    let mut top_ranking = BTreeMap::<(u64, String), FileResult>::new();
     let mut directories = HashMap::<PathBuf, DirectorySize>::new();
     let mut types = HashMap::<String, (u64, u64)>::new();
     // A bounded ranking avoids cloning/sorting up to a million matching paths.
@@ -387,7 +397,7 @@ pub fn scan_with_control(
             continue;
         }
         if !entry.file_type().is_file() { continue; }
-        if records.len() >= max_files {
+        if max_files.is_some_and(|limit| files_scanned >= limit) {
             truncated = true;
             break;
         }
@@ -409,6 +419,7 @@ pub fn scan_with_control(
             extension: file_type.clone(),
             content_status: content_status(&metadata).to_owned(),
         };
+        files_scanned = files_scanned.saturating_add(1);
         logical_bytes = logical_bytes.saturating_add(size);
         let category = types.entry(file_type).or_default();
         category.0 = category.0.saturating_add(size);
@@ -430,26 +441,25 @@ pub fn scan_with_control(
             matches.insert((size, result.path.clone()), result.clone());
             if matches.len() > MAX_MATCHES { matches.pop_first(); }
         }
-        let hash_eligible = !avoid_content_read(&metadata);
-        records.push(FileRecord { path, size, result, hash_eligible });
+        // The UI needs only the largest 300 results; track them as we walk.
+        // No O(number_of_files) clone-and-sort pass or full metadata cache.
+        top_ranking.insert((size, result.path.clone()), result);
+        if top_ranking.len() > MAX_RESULTS { top_ranking.pop_first(); }
+
+        if !hashing_skipped {
+            let hash_eligible = !avoid_content_read(&metadata);
+            records.push(FileRecord { path, size, hash_eligible });
+        }
         if last_update.elapsed() >= Duration::from_millis(250) {
             progress(ScanProgress {
                 phase: "scanning".into(),
-                files_scanned: records.len(),
+                files_scanned,
                 hash_bytes_read: 0,
             });
             last_update = Instant::now();
         }
     }
 
-    // Keep just the top 300 file copies, not a 250k-element cloned list.
-    let mut top_ranking = BTreeMap::<(u64, String), FileResult>::new();
-    for file in &records {
-        top_ranking.insert(
-            (file.size, file.result.path.clone()), file.result.clone()
-        );
-        if top_ranking.len() > MAX_RESULTS { top_ranking.pop_first(); }
-    }
     let top_files: Vec<FileResult> = top_ranking.into_iter().rev()
         .map(|(_, value)| value).collect();
     let matches: Vec<FileResult> = matches.into_iter().rev().map(|(_, file)| file).collect();
@@ -479,12 +489,12 @@ pub fn scan_with_control(
         check_cancel(cancel)?;
         progress(ScanProgress {
             phase: "complete".into(),
-            files_scanned: records.len(),
+            files_scanned,
             hash_bytes_read: 0,
         });
         return Ok(ScanReport {
             root: root.display().to_string(),
-            files_scanned: records.len(),
+            files_scanned,
             directories_scanned,
             logical_bytes,
             elapsed_ms: timer.elapsed().as_millis(),
@@ -606,7 +616,7 @@ pub fn scan_with_control(
             }
             match hash_result {
                 Ok(Some(hash)) => {
-                    groups.entry((record.size, hash)).or_default().push(record.result.path.clone());
+                    groups.entry((record.size, hash)).or_default().push(record.path.display().to_string());
                 }
                 Ok(None) => {
                     errors += 1;
@@ -633,7 +643,7 @@ pub fn scan_with_control(
     let mut duplicates = Vec::<DuplicateGroup>::new();
     progress(ScanProgress {
         phase: "verifying".into(),
-        files_scanned: records.len(),
+        files_scanned,
         hash_bytes_read: hashed_bytes,
     });
     for ((size_bytes, hash), copies) in groups {
@@ -705,12 +715,12 @@ pub fn scan_with_control(
     check_cancel(cancel)?;
     progress(ScanProgress {
         phase: "complete".into(),
-        files_scanned: records.len(),
+        files_scanned,
         hash_bytes_read: hashed_bytes,
     });
     Ok(ScanReport {
         root: root.display().to_string(),
-        files_scanned: records.len(),
+        files_scanned,
         directories_scanned,
         logical_bytes,
         elapsed_ms: timer.elapsed().as_millis(),
@@ -779,6 +789,51 @@ mod tests {
         assert_eq!(report.unwrap().files_scanned, 2);
         assert!(events.iter().any(|p| p.phase == "hashing"));
         assert_eq!(events.last().unwrap().phase, "complete");
+    }
+
+    #[test]
+    fn unlimited_metadata_scan_streams_bounded_results() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..360 {
+            fs::write(dir.path().join(format!("item_{i:04}")), [i as u8]).unwrap();
+        }
+        let report = scan(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: None,
+            analyze_duplicates: Some(false),
+        }).unwrap();
+        assert_eq!(report.files_scanned, 360);
+        assert!(!report.truncated);
+        assert_eq!(report.top_files.len(), MAX_RESULTS);
+        assert_eq!(report.total_matches, 360);
+        assert_eq!(report.matches.len(), 360);
+        assert!(report.hashing_skipped);
+        assert_eq!(report.hash_bytes_read, 0);
+    }
+
+    #[test]
+    fn explicit_sampling_limit_remains_available_and_is_disclosed() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            fs::write(dir.path().join(format!("file{i}")), [i as u8]).unwrap();
+        }
+        let report = scan(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: Some(3),
+            analyze_duplicates: Some(false),
+        }).unwrap();
+        assert_eq!(report.files_scanned, 3);
+        assert!(report.truncated);
+    }
+
+    #[test]
+    fn zero_file_limit_is_rejected_instead_of_silently_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(scan(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: Some(0),
+            analyze_duplicates: Some(false),
+        }).is_err());
     }
 
     #[test]
