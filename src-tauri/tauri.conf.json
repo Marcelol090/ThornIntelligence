@@ -10,14 +10,23 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{
-      "title": "Thorn Intelligence",
-      "width": 1420,
-      "height": 900,
-      "minWidth": 1010,
-      "minHeight": 680,
-      "transparent": true
-    }]
+    "windows": [
+      {
+        "title": "Thorn Intelligence",
+        "width": 1420,
+        "height": 900,
+        "minWidth": 1010,
+        "minHeight": 680,
+        "transparent": true,
+        "decorations": false,
+        "shadow": false
+      }
+    ]
   },
-  "bundle": { "active": false, "icon": ["icons/icon.ico"] }
+  "bundle": {
+    "active": false,
+    "icon": [
+      "icons/icon.ico"
+    ]
+  }
 }

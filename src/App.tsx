@@ -147,7 +147,12 @@ export default function App() {
     page.classList.add('native-vibrancy');
     const apply = async () => {
       try {
-        await getCurrentWindow().setEffects({
+        // Windows first-paint workaround (tauri#8632): start undecorated
+        // with no shadow, restore the native titlebar before requesting DWM.
+        const nativeWindow = getCurrentWindow();
+        await nativeWindow.setDecorations(true);
+        if (!mounted) return;
+        await nativeWindow.setEffects({
           effects: [Effect.Acrylic, Effect.Mica],
           state: EffectState.Active,
         });

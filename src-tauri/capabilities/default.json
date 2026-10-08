@@ -2,6 +2,13 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Only allow the native folder picker and core window APIs.",
-  "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-set-effects", "dialog:allow-open"]
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-decorations",
+    "core:window:allow-set-effects",
+    "dialog:allow-open"
+  ]
 }
