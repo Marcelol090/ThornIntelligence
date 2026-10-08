@@ -9,7 +9,7 @@ import {
   Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu, CloudOff,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
+import type { AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -47,7 +47,11 @@ function Tag({ children, tone = 'neutral' }: { children: ReactNode; tone?: strin
   return <span className={'tag tag-' + tone}>{children}</span>;
 }
 
-function FileRows({ files, copy }: { files: FileResult[]; copy: (path: string) => void }) {
+function FileRows({ files, copy, allocations }: {
+  files: FileResult[];
+  copy: (path: string) => void;
+  allocations?: Record<string, AllocationItem>;
+}) {
   if (!files.length) return <div className="empty-list">Nenhum arquivo encontrado nesta visualização.</div>;
   return <div className="file-table">
     <div className="file-table-head"><span>ARQUIVO</span><span>TIPO</span><span>TAMANHO</span><span></span></div>
@@ -56,7 +60,15 @@ function FileRows({ files, copy }: { files: FileResult[]; copy: (path: string) =
       <span className="type-cell">{file.extension}
         {file.contentStatus === 'offline' && <small className="storage-status remote" title="Metadados indicam armazenamento remoto/offline; o aplicativo não abriu o conteúdo">Remoto/offline</small>}
         {file.contentStatus === 'reparse' && <small className="storage-status reparse" title="Arquivo virtual ou redirecionado (reparse point); conteúdo não foi aberto">Redirecionado</small>}
-      </span><strong className="size-cell">{bytes(file.sizeBytes)}</strong>
+      </span><span className="size-cell"><strong>{bytes(file.sizeBytes)}</strong>
+        {allocations?.[file.path] && <small className="allocation-detail" title={
+          allocations[file.path].status === 'measured'
+            ? 'Tamanho alocado reportado pelo Windows (GetCompressedFileSizeW)'
+            : 'Medição omitida: arquivo alterado, virtual, fora do escopo ou inacessível'
+        }>{allocations[file.path].allocatedBytes !== null
+            ? 'Em disco: ' + bytes(allocations[file.path].allocatedBytes as number)
+            : 'Em disco: indisponível'}</small>}
+      </span>
       <button className="icon-button" type="button" title="Copiar caminho" aria-label={'Copiar caminho de ' + file.name} onClick={() => copy(file.path)}><Clipboard size={16}/></button>
     </div>)}
   </div>;
@@ -96,6 +108,8 @@ export default function App() {
   const [diskHealth, setDiskHealth] = useState<DiskHealth | null>(null);
   const [healthBusy, setHealthBusy] = useState(false);
   const [cloudFilter, setCloudFilter] = useState<'all' | 'offline' | 'reparse'>('all');
+  const [allocationBusy, setAllocationBusy] = useState(false);
+  const [allocationReport, setAllocationReport] = useState<AllocationReport | null>(null);
   const [mobileMenu, setMobileMenu] = useState(false);
 
   // Native DWM Mica (Windows 11), with Acrylic fallback (Windows 10).
@@ -125,7 +139,7 @@ export default function App() {
   }
 
   async function scanFolder(root?: string, pattern = regex, min = minMb, analyze = includeDuplicates) {
-    if (activeJob.current || busy || searchBusy) {
+    if (activeJob.current || busy || searchBusy || allocationBusy) {
       setError('Já existe uma análise em andamento.');
       return;
     }
@@ -157,6 +171,7 @@ export default function App() {
       const result = await invoke<ScanReport>('scan_path', { request, jobId, onProgress });
       setReport(result);
       setSearchResult(null);
+      setAllocationReport(null);
       setToast('Análise concluída em ' + duration(result.elapsedMs) + '.');
     } catch (err) {
       const message = String(err);
@@ -172,7 +187,7 @@ export default function App() {
 
   async function searchMetadata() {
     if (!report) return;
-    if (activeJob.current || busy || searchBusy) {
+    if (activeJob.current || busy || searchBusy || allocationBusy) {
       setError('Já existe uma operação em andamento.');
       return;
     }
@@ -208,6 +223,43 @@ export default function App() {
       setScanProgress(null);
       setCancelRequested(false);
       setSearchBusy(false);
+    }
+  }
+
+  async function measureAllocated() {
+    if (!report || !report.topFiles.length || activeJob.current || busy || searchBusy || allocationBusy) return;
+    setError('');
+    const jobId = crypto.randomUUID();
+    const onProgress = new Channel<ScanProgress>();
+    onProgress.onmessage = (event) => {
+      if (activeJob.current === jobId) setScanProgress(event);
+    };
+    activeJob.current = jobId;
+    setScanProgress(null);
+    setCancelRequested(false);
+    setAllocationBusy(true);
+    try {
+      const request: AllocationRequest = {
+        root: report.root,
+        targets: report.topFiles.slice(0, 300).map(file => ({
+          path: file.path, expectedSizeBytes: file.sizeBytes,
+        })),
+      };
+      const result = await invoke<AllocationReport>('measure_allocated_sizes', {
+        request, jobId, onProgress,
+      });
+      setAllocationReport(result);
+      setToast('Alocação consultada em ' + duration(result.elapsedMs)
+        + ' · ' + number(result.measured) + ' arquivos medidos.');
+    } catch (err) {
+      const message = String(err);
+      if (message.includes('cancelada')) setToast('Medição cancelada; os resultados anteriores foram preservados.');
+      else setError('Não foi possível medir o espaço alocado: ' + message);
+    } finally {
+      if (activeJob.current === jobId) activeJob.current = null;
+      setScanProgress(null);
+      setCancelRequested(false);
+      setAllocationBusy(false);
     }
   }
 
@@ -301,21 +353,23 @@ export default function App() {
                 onChange={event => setIncludeDuplicates(event.target.checked)}/>
               <span>Incluir BLAKE3 <small>{includeDuplicates ? 'Varredura completa (mais I/O)' : 'Desativado: modo rápido'}</small></span>
             </label>
-            <button className="primary-button" disabled={busy || searchBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
+            <button className="primary-button" disabled={busy || searchBusy || allocationBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
           </div>
         </div>
 
         <div className="scope-strip glass"><div className="scope-icon"><Folder size={19}/></div><div className="scope-details"><small>ESCOPO ATUAL</small><strong title={roots}>{scopeName}</strong></div><span className="scope-full" title={roots}>{scanned ? truncatePath(roots, 56) : 'Escolha uma pasta ou unidade para iniciar'}</span><Tag tone={scanned ? 'green' : 'neutral'}>{scanned ? 'ANALISADO' : 'AGUARDANDO'}</Tag></div>
 
-        {(busy || searchBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
+        {(busy || searchBusy || allocationBusy) && <div className="scan-activity glass" role="status" aria-live="polite">
           <div className="activity-spinner"><LoaderCircle size={20} className="spin"/></div>
           <div className="activity-details">
             <strong>{scanProgress?.phase === 'hashing' ? 'Verificando duplicados com BLAKE3' :
               scanProgress?.phase === 'verifying' ? 'Conferindo identidades físicas' :
               scanProgress?.phase === 'searching' ? 'Pesquisando metadados' :
+              scanProgress?.phase === 'allocation' ? 'Consultando alocação no Windows' :
               scanProgress?.phase === 'fingerprinting' ? 'Comparando amostras de 16 KiB' :
               'Analisando diretórios'}</strong>
             <small>{number(scanProgress?.filesScanned ?? 0)} {
+              scanProgress?.phase === 'allocation' ? 'arquivos medidos/consultados' :
               scanProgress?.phase === 'hashing' ? 'candidatos com BLAKE3 completo' :
               scanProgress?.phase === 'fingerprinting' ? 'candidatos amostrados' :
               'arquivos enumerados'
@@ -367,7 +421,14 @@ export default function App() {
         {section === 'explorer' && report && <section className="panel glass full-panel">
           <SectionHeading kicker="RANKING POR TAMANHO" title="Arquivos grandes"
             description="Os 300 maiores arquivos encontrados, com identificação de conteúdo offline e redirecionamentos feita apenas pelos metadados."
-            right={<Tag tone="blue">{report.topFiles.length} resultados</Tag>}/>
+            right={<div className="allocation-actions">
+              <Tag tone="blue">{report.topFiles.length} resultados</Tag>
+              <button type="button" className="outline-button" disabled={busy || searchBusy || allocationBusy}
+                onClick={() => void measureAllocated()}>
+                {allocationBusy ? <LoaderCircle size={16} className="spin"/> : <HardDrive size={16}/>}
+                {allocationBusy ? 'Medindo…' : 'Medir espaço em disco'}
+              </button>
+            </div>}/>
           <div className="storage-filters" role="group" aria-label="Filtrar por disponibilidade de arquivo">
             {([
               ['all', 'Todos'],
@@ -383,9 +444,17 @@ export default function App() {
           <p className="panel-note">O filtro atua sobre os 300 maiores arquivos do relatório.
             O status remoto é inferido por atributos do Windows; não exige download do arquivo.
             Outros arquivos virtuais podem não apresentar todos esses atributos.</p>
+          {allocationReport && <p className="panel-note">
+            Alocação consultada em {number(allocationReport.measured)} arquivos;
+            {number(allocationReport.skipped)} ignorados e {number(allocationReport.failed)} indisponíveis.
+            Valores restritos à lista dos 300 maiores — não são o espaço físico total da pasta
+            nem equivalem a espaço recuperável. Arquivos comprimidos/esparsos podem ter alocação inferior ao tamanho lógico.
+          </p>}
           <FileRows files={report.topFiles.filter(file =>
             cloudFilter === 'all' || file.contentStatus === cloudFilter
-          )} copy={copy}/>
+          )} copy={copy} allocations={allocationReport
+            ? Object.fromEntries(allocationReport.items.map(item => [item.path, item]))
+            : undefined}/>
         </section>}
 
         {section === 'duplicates' && report && <div className="stack-gap">

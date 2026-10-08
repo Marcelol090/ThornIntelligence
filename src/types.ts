@@ -103,7 +103,30 @@ export type Section = 'overview' | 'explorer' | 'duplicates' | 'search' | 'optim
 
 /** Lightweight IPC progress; no per-file paths or file contents are sent. */
 export interface ScanProgress {
-  phase: 'scanning' | 'hashing' | 'verifying' | 'searching' | 'complete';
+  phase: 'scanning' | 'fingerprinting' | 'hashing' | 'verifying' | 'searching' | 'allocation' | 'complete';
   filesScanned: number;
   hashBytesRead: number;
+}
+
+/** Read-only per-file Windows allocation query; never estimates recoverable space. */
+export interface AllocationTarget {
+  path: string;
+  expectedSizeBytes: number;
+}
+export interface AllocationRequest {
+  root: string;
+  targets: AllocationTarget[];
+}
+export interface AllocationItem {
+  path: string;
+  logicalBytes: number;
+  allocatedBytes: number | null;
+  status: 'measured' | 'excluded' | 'changed' | 'outside' | 'unavailable' | 'unsupported';
+}
+export interface AllocationReport {
+  items: AllocationItem[];
+  measured: number;
+  skipped: number;
+  failed: number;
+  elapsedMs: number;
 }

@@ -142,3 +142,19 @@ O limite era imposto em **dois lugares**: `maxFiles: 250_000` nas chamadas React
 - Erros de acesso e diretórios virtuais/reparse continuam sendo relatados separadamente. A ausência de um teto não significa acesso universal a arquivos protegidos.
 
 Testes unitários cobrem enumeração rápida completa com ranking limitado, limite explícito e rejeição de zero, além de busca sem truncamento com mais de 500 matches. Validar com >250.000 arquivos reais no Windows após compilar e rodar o Rust/TypeScript.
+
+## Funcionalidade: medir o espaço alocado no Windows (sem ler conteúdos)
+
+Na aba **Explorador**, o botão **Medir espaço em disco** consulta sob demanda o espaço que o filesystem declara como alocado para **até 300 arquivos já exibidos** no ranking. Os dados são apresentados por arquivo, ao lado do tamanho lógico. Nenhum hash BLAKE3 é recalculado e nenhum arquivo é modificado.
+
+**Método e limites:**
+- API oficial `GetCompressedFileSizeW` (Win32), adequada para identificar diferenças em arquivos esparsos e comprimidos, como alguns VHDX.
+- A consulta é realizada em `spawn_blocking` com progresso/cancelamento por sessão e rejeição explícita de solicitações acima de 300 arquivos. Não percorre novamente a árvore.
+- Os arquivos são identificados por caminho absoluto sob a raiz selecionada, com verificação de canonicalização, `symlink_metadata`, atributos offline/reparse e tamanho esperado. Arquivos fora do escopo, modificados, inacessíveis ou virtuais ficam **sem medida**; não se atribui zero artificial.
+- O método não abre nem lê o conteúdo dos arquivos. Para não disparar hidratação, não chama a API sobre arquivos marcados como offline/reparse. Em sistemas de arquivos/provedores especiais, a disponibilidade ou precisão do resultado pode variar.
+- O resultado cobre **apenas os 300 maiores arquivos exibidos**, não o volume inteiro. Números de arquivos com hardlinks, blocos compartilhados, compactação e deduplicação **não devem ser somados como espaço recuperável**. A quarentena também não libera capacidade enquanto preserva o arquivo no mesmo volume.
+- O relatório de alocação da sessão é invalidado após nova varredura e não é persistido como um snapshot definitivo.
+
+**Validação exigida:** `cargo test --manifest-path src-tauri/Cargo.toml`, `cargo check --manifest-path src-tauri/Cargo.toml`, `npm run build`; executar em Windows com arquivos esparsos, comprimidos e VHDX locais, com OneDrive Files On-Demand e diretórios redirecionados. Os três testes adicionados cobrem amostra regular (Windows), limite de 300, cancelamento, tamanho desatualizado e arquivos fora da raiz. Não anunciar métricas físicas de volume sem medir o volume inteiro.
+
+**Fontes técnicas obtidas via Exa:** [Microsoft GetCompressedFileSizeW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getcompressedfilesizew), [Microsoft sparse file size](https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-the-size-of-a-sparse-file), [windows-sys Win32 examples](https://docs.rs/crate/zccache/latest/source/src/platform/platform_win/fs/volume.rs).

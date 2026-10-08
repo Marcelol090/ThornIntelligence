@@ -282,3 +282,11 @@ html.native-vibrancy .glass-inset{background:rgba(22,39,65,.39);border-color:rgb
 .scan-hash-option span{display:grid;gap:2px}
 .scan-hash-option small{font-size:10px;color:#8ba5c2}
 @media(max-width:650px){.scan-controls{align-items:stretch;width:100%}.scan-controls .primary-button{justify-content:center}.scan-hash-option{justify-content:flex-start}}
+
+/* Read-only allocation view for the top 300. Do not imply physical reclaim. */
+.allocation-actions{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:10px}
+.allocation-actions .outline-button{display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.size-cell{display:flex;flex-direction:column;align-items:flex-end;gap:5px;min-width:0}
+.size-cell strong{white-space:nowrap}
+.allocation-detail{font-size:10px;line-height:1.35;font-weight:500;color:#89ceca;text-align:right;max-width:145px}
+@media(max-width:750px){.allocation-actions{justify-content:flex-start}.allocation-detail{max-width:100px}}
