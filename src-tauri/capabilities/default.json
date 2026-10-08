@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Only allow the native folder picker and core window APIs.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": ["core:default", "core:window:allow-set-effects", "dialog:allow-open"]
 }

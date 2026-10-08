@@ -239,3 +239,38 @@ small{font-size:12px}
 .activity-details small{font-size:11px;color:#8fa4bd}
 .scan-activity .outline-button{min-height:36px}
 @media(max-width:570px){.scan-activity{flex-wrap:wrap}.scan-activity .outline-button{width:100%}}
+
+/* Native Windows DWM Mica/Acrylic: CSS layers must remain translucent.
+   Applied only after Tauri setEffects succeeds. Opaque CSS fallback remains. */
+html.native-vibrancy{background:transparent!important}
+html.native-vibrancy body{
+  background:
+    radial-gradient(ellipse 75% 65% at 50% -8%,rgba(50,94,165,.23) 0,transparent 75%),
+    radial-gradient(ellipse 52% 63% at 105% 65%,rgba(57,60,128,.20) 0,transparent 78%),
+    rgba(7,13,25,.46);
+}
+html.native-vibrancy .app-shell{background:rgba(4,11,22,.16)}
+html.native-vibrancy .main-shell{background:linear-gradient(145deg,rgba(5,11,23,.26),rgba(7,14,29,.54))}
+html.native-vibrancy .sidebar{
+  background:linear-gradient(150deg,rgba(21,37,64,.53),rgba(8,18,37,.66));
+  backdrop-filter:blur(34px) saturate(1.28);
+  -webkit-backdrop-filter:blur(34px) saturate(1.28);
+}
+html.native-vibrancy .glass{
+  background:linear-gradient(142deg,rgba(38,61,100,.41),rgba(14,25,50,.43) 78%);
+  border-color:rgba(192,220,255,.20);
+  box-shadow:inset 0 1px rgba(255,255,255,.12),0 18px 44px rgba(2,4,14,.22);
+  backdrop-filter:blur(27px) saturate(1.30);
+  -webkit-backdrop-filter:blur(27px) saturate(1.30);
+}
+html.native-vibrancy .glass-inset{background:rgba(22,39,65,.39);border-color:rgba(170,210,255,.18)}
+/* A disabled DWM transparency setting may make the desktop backdrop solid.
+   In either case foreground contrast is preserved by tinted panels. */
+.storage-filters{display:flex;flex-wrap:wrap;gap:8px;margin:15px 0 10px}
+.storage-filter{display:inline-flex;align-items:center;gap:7px;padding:9px 13px;border-radius:10px;
+  border:1px solid rgba(159,201,255,.17);color:#9bb2ce;background:rgba(35,59,95,.18);font-size:11px}
+.storage-filter.active{border-color:rgba(125,192,255,.64);background:rgba(37,102,179,.35);color:#d0eaff}
+.storage-filter:focus-visible{outline:2px solid #81c8ff;outline-offset:2px}
+.storage-status{display:block;margin-top:4px;font-size:10px;font-weight:700;line-height:1.3}
+.storage-status.remote{color:#f0c68e}
+.storage-status.reparse{color:#96c9f2}
