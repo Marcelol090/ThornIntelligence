@@ -2,7 +2,7 @@
 
 ## Indexação incremental (somente metadados)
 
-O SQLite fica em AppLocalData, usa rusqlite 0.40.2 com SQLite incorporado, WAL, synchronous=FULL, timeout de escrita e uma transação atômica por snapshot. Cada atualização enumera novamente o sistema de arquivos, compara caminho/tamanho/mtime-ns/atributos, identifica novos/alterados/inalterados e remove registros ausentes somente ao COMMIT. Cancelamento, entradas inacessíveis e limite de arquivos provocam ROLLBACK; o snapshot anterior continua consultável.
+O SQLite fica em AppLocalData, usa rusqlite 0.40.2 com SQLite incorporado, WAL, synchronous=FULL e timeout de escrita. A enumeração deposita metadados numa tabela TEMP exclusiva da conexão (SQLite pode usar arquivo temporário local), sem manter uma transação de escrita no banco principal durante a caminhada. Ao final, uma transação atômica publica a geração e remove entradas ausentes; a transação ainda pode bloquear outros escritores durante essa fase final. A cada atualização, caminho/tamanho/mtime-ns/atributos são comparados para classificar novos/alterados/inalterados. Cancelamento, entradas inacessíveis e limite de arquivos descartam o estágio temporário ao fechar a conexão; o snapshot anterior permanece consultável. O custo adicional de staging e o tempo de COMMIT para milhões de arquivos ainda exigem benchmarks.
 
 A pesquisa em cache consulta a última geração completa sem abrir arquivos de usuário. Até 500 resultados são retornados, e a data do snapshot é exibida para indicar possível desatualização. Ainda não é USN Journal, monitoramento em tempo real nem cache BLAKE3; NÃO reutilizar hashes com base apenas em mtime/tamanho. Diretórios reparse/junction/cloud são excluídos, com contagem explícita.
 
@@ -25,7 +25,7 @@ Executar no Windows, com Node 22, Rust stable, Visual Studio Build Tools e SDK:
 - cargo check --manifest-path src-tauri/Cargo.toml
 - npm run tauri dev
 
-Testes incluídos: criação de snapshot, refresh sem mudanças, mudanças/remoções, cancelamento que preserva índice, confirmação e UUID inválidos, e no Windows round-trip de quarentena/restauração sem sobrescrever colisões. Validar ainda OneDrive Files On-Demand, arquivos sparse, ACLs, hardlinks, NTFS/ReFS, unidades C: versus D:, crash durante WAL/manifesto, e concorrência com renomeações.
+Testes incluídos: criação de snapshot, refresh sem mudanças, mudanças/remoções, cancelamento que preserva índice, escrita concorrente durante enumeração com staging temporário, confirmação e UUID inválidos, e no Windows round-trip de quarentena/restauração sem sobrescrever colisões. Validar ainda OneDrive Files On-Demand, arquivos sparse, ACLs, hardlinks, NTFS/ReFS, unidades C: versus D:, crash durante WAL/manifesto, e concorrência com renomeações.
 
 Não considerar homologado se CI não iniciou os jobs.
 

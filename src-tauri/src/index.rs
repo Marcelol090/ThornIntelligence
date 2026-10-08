@@ -90,8 +90,10 @@ pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
 }
 
 /// Metadata-only incremental refresh. No cloud file contents are opened.
-/// Every change and generation bump is one atomic transaction. Cancellation,
-/// errors, or file limits roll it back, preserving the last completed snapshot.
+/// Enumeration writes only to a connection-local TEMP staging table, never
+/// holding the main WAL writer lock while walking a potentially huge tree.
+/// The final publish is atomic: cancellation/errors leave the old snapshot
+/// untouched, and no incomplete generation is visible to readers.
 pub fn refresh(
     db_path: &Path,
     requested_root: &str,
@@ -108,25 +110,31 @@ pub fn refresh(
     }
     let root_str = root.to_string_lossy().into_owned();
     let mut conn = connection(db_path)?;
-    let tx = conn.transaction().map_err(db_err)?;
-    let old_generation: i64 = tx.query_row(
+    // TEMP storage is private to this connection and automatically disappears
+    // after a crash. Quarantine writes on a separate connection can proceed
+    // while filesystem enumeration populates this staging table.
+    conn.execute_batch("
+        CREATE TEMP TABLE IF NOT EXISTS index_refresh_staging (
+            path TEXT PRIMARY KEY,
+            size_bytes INTEGER NOT NULL,
+            modified_ns INTEGER NOT NULL,
+            attributes INTEGER NOT NULL
+        );
+        DELETE FROM temp.index_refresh_staging;
+    ").map_err(db_err)?;
+    let old_generation: i64 = conn.query_row(
         "SELECT generation FROM indexed_scopes WHERE root = ?1",
         params![root_str], |row| row.get(0),
     ).optional().map_err(db_err)?.unwrap_or(0);
     let generation = old_generation.checked_add(1)
         .ok_or("Contador de gerações do índice esgotado.")?;
 
-    let mut lookup = tx.prepare_cached(
+    let mut lookup = conn.prepare_cached(
         "SELECT size_bytes, modified_ns, attributes FROM indexed_files WHERE root=?1 AND path=?2"
     ).map_err(db_err)?;
-    let mut upsert = tx.prepare_cached("
-      INSERT INTO indexed_files(root,path,size_bytes,modified_ns,attributes,generation)
-      VALUES(?1,?2,?3,?4,?5,?6)
-      ON CONFLICT(root,path) DO UPDATE SET
-        size_bytes=excluded.size_bytes,
-        modified_ns=excluded.modified_ns,
-        attributes=excluded.attributes,
-        generation=excluded.generation
+    let mut upsert = conn.prepare_cached("
+      INSERT INTO temp.index_refresh_staging(path,size_bytes,modified_ns,attributes)
+      VALUES(?1,?2,?3,?4)
     ").map_err(db_err)?;
     let limit = max_files.clamp(1, 1_000_000);
     let mut files = 0usize;
@@ -174,10 +182,10 @@ pub fn refresh(
             Some(old) if old == (size, modified, flags) => unchanged += 1,
             Some(_) => changed += 1,
         }
-        upsert.execute(params![root_str, path, size, modified, flags, generation])
+        upsert.execute(params![path, size, modified, flags])
             .map_err(db_err)?;
         files += 1;
-        if last_event.elapsed() >= Duration::from_millis(250) {
+        if files % 512 == 0 || last_event.elapsed() >= Duration::from_millis(250) {
             progress(ScanProgress {
                 phase: "indexing".into(), files_scanned: files, hash_bytes_read: 0,
             });
@@ -189,10 +197,36 @@ pub fn refresh(
     if cancel.load(Ordering::Relaxed) {
         return Err("Indexação cancelada pelo usuário. Snapshot anterior preservado.".into());
     }
-    // Rows absent from this generation become invisible to search and are
-    // pruned atomically. Reparse subtrees are deliberately outside the scope.
+    // Acquire the main database writer lock only for the publish phase.
+    // A concurrent refresh must not overwrite a newer completed snapshot.
+    let tx = conn.transaction().map_err(db_err)?;
+    let published_generation: i64 = tx.query_row(
+        "SELECT generation FROM indexed_scopes WHERE root=?1",
+        params![root_str], |row| row.get(0),
+    ).optional().map_err(db_err)?.unwrap_or(0);
+    if published_generation != old_generation {
+        return Err("Índice atualizado por outra tarefa; snapshot anterior preservado.".into());
+    }
+    // Prune removed files and publish staged metadata under one transaction.
+    // The WHERE clause before ON CONFLICT disambiguates INSERT...SELECT
+    // from an SQLite JOIN clause.
     let removed = tx.execute(
-        "DELETE FROM indexed_files WHERE root=?1 AND generation<>?2",
+        "DELETE FROM indexed_files WHERE root=?1
+         AND NOT EXISTS (
+           SELECT 1 FROM temp.index_refresh_staging AS staged
+           WHERE staged.path=indexed_files.path
+         )",
+        params![root_str],
+    ).map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO indexed_files(root,path,size_bytes,modified_ns,attributes,generation)
+         SELECT ?1,path,size_bytes,modified_ns,attributes,?2
+         FROM temp.index_refresh_staging WHERE 1
+         ON CONFLICT(root,path) DO UPDATE SET
+           size_bytes=excluded.size_bytes,
+           modified_ns=excluded.modified_ns,
+           attributes=excluded.attributes,
+           generation=excluded.generation",
         params![root_str, generation],
     ).map_err(db_err)?;
     let completed_at_unix = now_unix();
@@ -300,6 +334,62 @@ mod tests {
         }).unwrap();
         assert_eq!(found.report.total_matches, 1);
         assert_eq!(found.report.matches[0].name, "a.txt");
+    }
+
+    #[test]
+    fn another_writer_can_commit_during_filesystem_enumeration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        for i in 0..520 {
+            fs::write(root.join(format!("item_{i:04}")), [i as u8]).unwrap();
+        }
+        let db = dir.path().join("idx.sqlite");
+        let token = AtomicBool::new(false);
+        let mut wrote = false;
+        let result = refresh(&db, root.to_str().unwrap(), 600, &token, |event| {
+            if event.phase == "indexing" && event.files_scanned >= 512 && !wrote {
+                let other = connection(&db).unwrap();
+                other.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS writer_probe(id INTEGER PRIMARY KEY);
+                     INSERT INTO writer_probe(id) VALUES(1);"
+                ).unwrap();
+                wrote = true;
+            }
+        }).unwrap();
+        assert!(wrote, "writer probe must run after staged records exist");
+        assert_eq!(result.files, 520);
+        let other = connection(&db).unwrap();
+        let probe: i64 = other.query_row(
+            "SELECT COUNT(*) FROM writer_probe", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(probe, 1);
+    }
+
+    #[test]
+    fn cancelled_refresh_discards_temp_stage_and_preserves_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("before.txt"), "original").unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let token = AtomicBool::new(false);
+        refresh(&db, root.to_str().unwrap(), 100, &token, |_| {}).unwrap();
+        for i in 0..520 {
+            fs::write(root.join(format!("new_{i:04}")), [i as u8]).unwrap();
+        }
+        let err = refresh(&db, root.to_str().unwrap(), 600, &token, |event| {
+            if event.files_scanned >= 512 {
+                token.store(true, Ordering::Relaxed);
+            }
+        }).unwrap_err();
+        assert!(err.contains("cancelada"));
+        let old = search_index(&db, SearchRequest {
+            root: root.to_string_lossy().to_string(), regex: None,
+            min_size_bytes: None, max_files: None,
+        }).unwrap();
+        assert_eq!(old.report.total_matches, 1);
+        assert_eq!(old.report.matches[0].name, "before.txt");
     }
 
     #[test]
