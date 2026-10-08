@@ -95,9 +95,16 @@ fn safe_metadata(path: &Path, app_data: &Path, managed_restore: bool) -> Result<
         return Err(protect_error());
     }
     let canonical = std::fs::canonicalize(path).map_err(|_| protect_error())?;
+    // canonicalize() on Windows may add a \\?\ prefix, so compare
+    // canonical paths rather than mixing lexical and canonical forms.
     if managed_restore {
-        if !is_within(&canonical, &app_data.join("quarantine")) { return Err(protect_error()); }
-    } else if is_within(&canonical, app_data) { return Err(protect_error()); }
+        let trusted = std::fs::canonicalize(app_data.join("quarantine"))
+            .map_err(|_| protect_error())?;
+        if !is_within(&canonical, &trusted) { return Err(protect_error()); }
+    } else if std::fs::canonicalize(app_data).ok()
+        .is_some_and(|trusted| is_within(&canonical, &trusted)) {
+        return Err(protect_error());
+    }
     if !managed_restore { for name in [
         "SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)",
         "ProgramData", "APPDATA", "LOCALAPPDATA",
@@ -309,7 +316,10 @@ pub fn restore(id: String, confirmation: String, app_data: &Path)
         checked_ancestors(&source)?;
         let parent = original.parent().ok_or_else(protect_error)?;
         let parent = std::fs::canonicalize(parent).map_err(|_| protect_error())?;
-        if parent.starts_with(app_data) { return Err(protect_error()); }
+        if std::fs::canonicalize(app_data).ok()
+            .is_some_and(|trusted| parent.starts_with(&trusted)) {
+            return Err(protect_error());
+        }
         for name in [
             "SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)",
             "ProgramData", "APPDATA", "LOCALAPPDATA",
