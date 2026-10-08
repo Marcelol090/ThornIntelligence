@@ -58,6 +58,44 @@ fn is_reparse(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink() || (attributes(metadata) & 0x400 != 0)
 }
 
+/**
+ * Reject reparse points in the *original* path, including its ancestors,
+ * before canonicalize() resolves them. Checking only the canonical root
+ * loses evidence that a junction/symlink was used to reach it.
+ *
+ * The index is metadata-only, but a redirected root can silently include
+ * an unintended tree and undermine the scope selected by the user.
+ * This is a path-level guard, not an atomic defense against hostile races.
+ */
+fn validated_root(requested_root: &str) -> Result<PathBuf, String> {
+    let requested = Path::new(requested_root);
+    if requested.as_os_str().is_empty() {
+        return Err("Selecione uma pasta para indexar.".into());
+    }
+    for ancestor in requested.ancestors() {
+        // Relative paths have an empty final ancestor; it is not a filesystem entry.
+        if ancestor.as_os_str().is_empty() { continue; }
+        let metadata = std::fs::symlink_metadata(ancestor)
+            .map_err(|e| format!("Raiz ou diretório ancestral inacessível: {e}"))?;
+        if is_reparse(&metadata) {
+            return Err("Raiz ou diretório ancestral redirecionado (symlink/junction/reparse): indexação bloqueada.".into());
+        }
+    }
+    let root = std::fs::canonicalize(requested)
+        .map_err(|e| format!("Pasta não encontrada: {e}"))?;
+    if !root.is_dir() { return Err("Selecione uma pasta.".into()); }
+    // Validate the resolved tree too; avoid inheriting a redirected volume mount.
+    for ancestor in root.ancestors() {
+        if ancestor.as_os_str().is_empty() { continue; }
+        let metadata = std::fs::symlink_metadata(ancestor)
+            .map_err(|e| format!("Diretório canônico inacessível: {e}"))?;
+        if is_reparse(&metadata) {
+            return Err("Raiz canônica contém redirecionamento/reparse: indexação bloqueada.".into());
+        }
+    }
+    Ok(root)
+}
+
 pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(db_err)?;
@@ -100,12 +138,7 @@ pub fn refresh(
     mut progress: impl FnMut(ScanProgress),
 ) -> Result<IndexStats, String> {
     let timer = Instant::now();
-    let root = std::fs::canonicalize(requested_root)
-        .map_err(|e| format!("Pasta não encontrada: {e}"))?;
-    if !root.is_dir() { return Err("Selecione uma pasta.".into()); }
-    if is_reparse(&std::fs::symlink_metadata(&root).map_err(db_err)?) {
-        return Err("Raiz redirecionada/reparse não pode ser indexada.".into());
-    }
+    let root = validated_root(requested_root)?;
     let root_str = root.to_string_lossy().into_owned();
     let mut conn = connection(db_path)?;
     let tx = conn.transaction().map_err(db_err)?;
@@ -218,9 +251,7 @@ pub fn refresh(
 /// traversal or opening user files. Results remain snapshots, not live truth.
 pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSearch, String> {
     let timer = Instant::now();
-    let root = std::fs::canonicalize(&request.root)
-        .map_err(|e| format!("Raiz do índice indisponível: {e}"))?;
-    let root = root.to_string_lossy().into_owned();
+    let root = validated_root(&request.root)?.to_string_lossy().into_owned();
     let pattern = request.regex.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let regex = match pattern {
         Some(p) if p.len() > 4096 => return Err("Regex excede 4096 bytes.".into()),
@@ -276,6 +307,50 @@ pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSea
 mod tests {
     use super::*;
     use std::fs;
+
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_direct_and_ancestor_symlink_roots_before_canonicalization() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let nested = real.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("file.txt"), b"safe").unwrap();
+        let link = dir.path().join("alias");
+        symlink(&real, &link).unwrap();
+
+        // The resolved directory itself is safe; its aliases are not.
+        assert_eq!(validated_root(real.to_str().unwrap()).unwrap(), real);
+        assert!(validated_root(link.to_str().unwrap()).is_err());
+        assert!(validated_root(link.join("nested").to_str().unwrap()).is_err());
+        let db = dir.path().join("index.sqlite");
+        let token = AtomicBool::new(false);
+        assert!(refresh(&db, link.to_str().unwrap(), 100, &token, |_| {}).is_err());
+        assert!(refresh(&db, link.join("nested").to_str().unwrap(), 100, &token, |_| {}).is_err());
+        assert!(!db.exists(), "rejected roots must not create an index");
+        // A stale snapshot must not be accessed via a redirected alias either.
+        assert!(search_index(&db, SearchRequest {
+            root: link.to_string_lossy().into_owned(), regex: None,
+            min_size_bytes: None, max_files: None,
+        }).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_directory_symlink_when_available() {
+        use std::os::windows::fs::symlink_dir;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        let alias = dir.path().join("alias");
+        // Creating symlinks may require Developer Mode or elevated permissions.
+        if symlink_dir(&real, &alias).is_err() { return; }
+        assert!(validated_root(alias.to_str().unwrap()).unwrap_err().contains("redirecionado"));
+        assert!(validated_root(alias.join("sub").to_str().unwrap())
+            .unwrap_err().contains("redirecionado"));
+    }
 
     #[test]
     fn updates_only_changed_entries_and_prunes_removed_entries() {

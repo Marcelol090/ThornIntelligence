@@ -37,3 +37,11 @@ Não considerar homologado se CI não iniciou os jobs.
 - Microsoft MoveFileExW flags: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
 - Microsoft reparse points: https://learn.microsoft.com/en-us/windows/win32/fileio/reparse-points
 - Rust stable limitations on Windows MetadataExt: https://doc.rust-lang.org/std/os/windows/fs/trait.MetadataExt.html
+
+## Verificação de raiz e ancestrais (08/10/2026)
+
+A validação de raiz do índice ocorre **antes** de `canonicalize`, com `symlink_metadata` em cada ancestral da entrada. Isso impede que uma raiz selecionada via symlink/junction seja normalizada silenciosamente para outra árvore. A busca no snapshot aplica a mesma política. Após a resolução, a cadeia canônica também é verificada. O comportamento é deliberadamente conservador: raízes com reparse points são rejeitadas, inclusive alguns pontos de montagem legítimos; isso evita indexação fora do escopo consentido, mas não substitui abertura por handles para proteção completa contra TOCTOU.
+
+Testes: symlink direto e em ancestral no Unix; teste condicional de symlink no Windows, quando a conta tem permissão para criá-lo. Não realizar operações de limpeza ou restauração usando a existência de um snapshot como prova de segurança.
+
+Fontes: [Rust canonicalize](https://doc.rust-lang.org/stable/std/fs/fn.canonicalize.html), [Rust symlink_metadata](https://doc.rust-lang.org/stable/std/fs/fn.symlink_metadata.html), [SQLite WAL](https://www.sqlite.org/wal.html).
