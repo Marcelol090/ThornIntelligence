@@ -145,6 +145,8 @@ Referências pesquisadas via Exa:
 - Single writer, transações por lote e recuperação após cancelamento/crash. Cada snapshot completo deve ser marcado concluído ou incompleto.
 - Quarentena reversível vem depois: manifesto auditável, confirmação explícita, restauração e exclusão permanente isolada.
 
+
+
 ## Persistência e quarentena (primeira implementação)
 
 - index.rs: SQLite WAL com snapshots atômicos por raiz, identificação de arquivos alterados pelo inventário de metadados, consulta Regex do último snapshot e ROLLBACK em cancelamento/erro. Não reutiliza hashes BLAKE3 por mtime.

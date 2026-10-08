@@ -16,7 +16,7 @@
       "height": 900,
       "minWidth": 1010,
       "minHeight": 680,
-      "backgroundColor": "#080d1a"
+      "transparent": true
     }]
   },
   "bundle": { "active": false, "icon": ["icons/icon.ico"] }
