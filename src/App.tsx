@@ -250,6 +250,7 @@ export default function App() {
   }
 
   async function pickQuarantineFile() {
+    if (quarantineBusy) return;
     try {
       const path = await open({ directory: false, multiple: false,
         title: 'Escolha um arquivo local para pré-visualizar' });
@@ -267,6 +268,7 @@ export default function App() {
   }
 
   async function previewQuarantine() {
+    if (quarantineBusy) return;
     setError(''); setPreview(null); setMoveConfirmation(''); setQuarantineBusy(true);
     try {
       const next = await invoke<QuarantinePreview>('preview_quarantine', { path: quarantinePath });
@@ -276,7 +278,7 @@ export default function App() {
   }
 
   async function moveToQuarantine() {
-    if (!preview || moveConfirmation !== 'MOVER PARA QUARENTENA') return;
+    if (quarantineBusy || !preview || moveConfirmation !== 'MOVER PARA QUARENTENA') return;
     setError(''); setQuarantineBusy(true);
     try {
       await invoke<QuarantineItem>('quarantine_file', {
@@ -294,7 +296,7 @@ export default function App() {
   }
 
   async function restoreQuarantine(id: string) {
-    if (restoreConfirmation !== 'RESTAURAR') return;
+    if (quarantineBusy || restoreConfirmation !== 'RESTAURAR') return;
     setError(''); setQuarantineBusy(true);
     try {
       await invoke<QuarantineItem>('restore_quarantine', {
@@ -493,10 +495,11 @@ export default function App() {
               description="Pastas, OneDrive, arquivos do sistema, hardlinks e links simbólicos são bloqueados pelo backend."/>
             <div className="search-form">
               <label className="field"><span>Caminho absoluto do arquivo</span>
-                <input type="text" value={quarantinePath}
+                <input type="text" value={quarantinePath} disabled={quarantineBusy}
                   onChange={event => { setQuarantinePath(event.target.value); setPreview(null); setMoveConfirmation(''); }}
                   placeholder="C:\\Users\\...\\arquivo.tmp"/></label>
-              <button type="button" className="outline-button" onClick={() => void pickQuarantineFile()}>Selecionar arquivo</button>
+              <button type="button" className="outline-button" disabled={quarantineBusy}
+                onClick={() => void pickQuarantineFile()}>Selecionar arquivo</button>
               <button type="button" className="primary-button" disabled={!quarantinePath || quarantineBusy}
                 onClick={() => void previewQuarantine()}>Pré-visualizar</button>
             </div>
