@@ -241,7 +241,10 @@ pub(crate) fn content_hash_with_progress(
         // A single sequential reader avoids the random disk seeks associated
         // with multithreaded/mmap readers on spinning disks. The buffer is
         // heap allocated; no 4 MiB stack frame per hash job.
-        let mut buffer = vec![0u8; HASH_IO_CHUNK];
+        // Avoid zero-initializing 4 MiB for every tiny candidate. Large
+        // files still receive the full sequential I/O chunk size.
+        let buffer_len = expected_size.min(HASH_IO_CHUNK as u64) as usize;
+        let mut buffer = vec![0u8; buffer_len];
         while bytes_read < expected_size {
             if cancel.load(Ordering::Relaxed) {
                 return Err(std::io::Error::new(
