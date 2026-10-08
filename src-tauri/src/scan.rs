@@ -72,6 +72,8 @@ pub struct ScanReport {
     pub truncated: bool,
     pub duplicate_analysis_complete: bool,
     pub hardlink_aliases: usize,
+    /// Candidates skipped to avoid opening cloud/offline/reparse content.
+    pub skipped_content_files: usize,
     pub hash_bytes_read: u64,
     pub top_files: Vec<FileResult>,
     pub top_directories: Vec<DirectoryResult>,
@@ -87,6 +89,7 @@ struct FileRecord {
     path: PathBuf,
     size: u64,
     result: FileResult,
+    hash_eligible: bool,
 }
 
 #[derive(Default)]
@@ -108,9 +111,44 @@ fn extension(path: &Path) -> String {
         .unwrap_or_else(|| "sem extensão".into())
 }
 
+// On Windows these flags identify offline, recall-on-access and reparse
+// content. Skip all reparse files conservatively: opening a cloud placeholder
+// may hydrate gigabytes even when the UI is only browsing metadata.
+#[cfg(windows)]
+fn unsafe_content_attributes(attributes: u32) -> bool {
+    const REPARSE_POINT: u32 = 0x0000_0400;
+    const OFFLINE: u32 = 0x0000_1000;
+    const RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    attributes & (REPARSE_POINT | OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS) != 0
+}
+
+#[cfg(windows)]
+fn avoid_content_read(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    unsafe_content_attributes(metadata.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn avoid_content_read(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
 fn content_hash(path: &Path, expected_size: u64) -> std::io::Result<Option<String>> {
+    // Check metadata *before* opening content to avoid most cloud hydration.
+    // A concurrent filesystem change remains possible (TOCTOU); no destructive
+    // operation is authorized by these results.
+    let before = std::fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink()
+        || avoid_content_read(&before)
+        || before.len() != expected_size
+    {
+        return Ok(None);
+    }
+    let modified = before.modified()?;
     let file = File::open(path)?;
-    if file.metadata()?.len() != expected_size {
+    let opened = file.metadata()?;
+    if opened.len() != expected_size || opened.modified()? != modified {
         return Ok(None);
     }
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
@@ -123,7 +161,18 @@ fn content_hash(path: &Path, expected_size: u64) -> std::io::Result<Option<Strin
         count += bytes as u64;
         hasher.update(&buffer[..bytes]);
     }
-    if count != expected_size { return Ok(None); }
+    let after = reader.get_ref().metadata()?;
+    if count != expected_size || after.len() != expected_size || after.modified()? != modified {
+        return Ok(None);
+    }
+    let path_after = std::fs::symlink_metadata(path)?;
+    if path_after.file_type().is_symlink()
+        || avoid_content_read(&path_after)
+        || path_after.len() != expected_size
+        || path_after.modified()? != modified
+    {
+        return Ok(None);
+    }
     Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
@@ -218,7 +267,8 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
             total_matches += 1;
             matches.push(result.clone());
         }
-        records.push(FileRecord { path, size, result });
+        let hash_eligible = !avoid_content_read(&metadata);
+        records.push(FileRecord { path, size, result, hash_eligible });
     }
 
     let mut top_files: Vec<FileResult> = records.iter().map(|file| file.result.clone()).collect();
@@ -259,10 +309,16 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
     candidate_buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
     let mut hashed_bytes = 0_u64;
+    let mut skipped_content_files = 0_usize;
     let mut duplicate_analysis_complete = true;
     let mut groups = HashMap::<(u64, String), Vec<String>>::new();
     for (size, bucket) in candidate_buckets {
         for record in bucket {
+            if !record.hash_eligible {
+                skipped_content_files += 1;
+                duplicate_analysis_complete = false;
+                continue;
+            }
             if hashed_bytes.saturating_add(size) > MAX_HASH_BYTES {
                 duplicate_analysis_complete = false;
                 continue;
@@ -272,9 +328,16 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
                     hashed_bytes = hashed_bytes.saturating_add(size);
                     groups.entry((size, hash)).or_default().push(record.result.path.clone());
                 }
-                Ok(None) => { errors += 1; }
+                Ok(None) => {
+                    errors += 1;
+                    duplicate_analysis_complete = false;
+                    if error_samples.len() < 12 {
+                        error_samples.push(format!("Arquivo alterado ou indisponível durante hash: {}", record.path.display()));
+                    }
+                }
                 Err(err) => {
                     errors += 1;
+                    duplicate_analysis_complete = false;
                     if error_samples.len() < 12 {
                         error_samples.push(format!("{}: {err}", record.path.display()));
                     }
@@ -300,6 +363,16 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
         let mut independently_allocated = Vec::<String>::new();
         let mut identity_verified = true;
         for path in copies {
+            // Identity inspection also opens a handle; recheck before doing so.
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if !meta.file_type().is_symlink() && !avoid_content_read(&meta) => {}
+                _ => {
+                    identity_verified = false;
+                    duplicate_analysis_complete = false;
+                    skipped_content_files += 1;
+                    break;
+                }
+            }
             match Handle::from_path(&path) {
                 Ok(handle) if unique_files.insert(handle) => {
                     independently_allocated.push(path);
@@ -350,6 +423,7 @@ pub fn scan(request: ScanRequest) -> Result<ScanReport, String> {
         truncated,
         duplicate_analysis_complete,
         hardlink_aliases,
+        skipped_content_files,
         hash_bytes_read: hashed_bytes,
         top_files,
         top_directories,
@@ -444,6 +518,23 @@ mod tests {
         assert_eq!(report.files_scanned, 2);
         assert!(report.duplicates.is_empty());
         assert_eq!(report.potential_savings_bytes, 0);
+    }
+
+    #[test]
+    fn rejects_size_mismatch_before_reading_file_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("size.dat");
+        fs::write(&file, b"sample").unwrap();
+        assert!(content_hash(&file, 100).unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_offline_and_reparse_flags_are_never_hashed() {
+        assert!(!unsafe_content_attributes(0));
+        for flag in [0x0000_0400, 0x0000_1000, 0x0004_0000, 0x0040_0000] {
+            assert!(unsafe_content_attributes(flag));
+        }
     }
 
     #[test]

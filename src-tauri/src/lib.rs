@@ -5,6 +5,8 @@ mod scan;
 use health::DiskHealth;
 use optimize::OptimizationResult;
 use scan::{ScanReport, ScanRequest};
+use std::sync::Arc;
+use tauri::State;
 
 #[tauri::command]
 async fn scan_path(request: ScanRequest) -> Result<ScanReport, String> {
@@ -14,8 +16,13 @@ async fn scan_path(request: ScanRequest) -> Result<ScanReport, String> {
 }
 
 #[tauri::command]
-async fn optimize_volume(drive: String, execute: bool) -> Result<OptimizationResult, String> {
-    tauri::async_runtime::spawn_blocking(move || optimize::run(drive, execute))
+async fn optimize_volume(
+    drive: String,
+    execute: bool,
+    gate: State<'_, Arc<optimize::OptimizationGate>>,
+) -> Result<OptimizationResult, String> {
+    let gate = Arc::clone(gate.inner());
+    tauri::async_runtime::spawn_blocking(move || optimize::run(drive, execute, &gate))
         .await
         .map_err(|err| format!("Falha interna da tarefa de otimização: {err}"))?
 }
@@ -31,6 +38,7 @@ async fn disk_health(drive: String) -> Result<DiskHealth, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(Arc::new(optimize::OptimizationGate::default()))
         .invoke_handler(tauri::generate_handler![scan_path, optimize_volume, disk_health])
         .run(tauri::generate_context!())
         .expect("error while running Thorn Intelligence");

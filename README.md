@@ -19,12 +19,11 @@ Pré-requisitos: Node.js 20.19+/22+, Rust stable, Visual Studio C++ Build Tools 
 ```powershell
 git clone https://github.com/Marcelol090/ThornIntelligence.git
 cd ThornIntelligence
-git switch feat/storage-intelligence-mvp
 npm install
 npm run tauri dev
 ```
 
-O código ainda está em uma branch de feature, que deverá ser revisada antes de entrar em `main`.
+O núcleo inicial está em `main`; recursos de segurança e saúde adicionais estão sendo revisados em PRs separados.
 
 `npm run dev` sozinho mostra a interface no navegador, **mas não executa o scanner Rust**. Use `npm run tauri dev` para análise de arquivos e integração com o Windows.
 
@@ -50,9 +49,12 @@ O código ainda está em uma branch de feature, que deverá ser revisada antes d
 - Não segue symlinks. Erros de acesso são contabilizados.
 - Até 1.024 referências por grupo de hash para a identificação de hardlinks. Grupos maiores ou identidades inacessíveis são omitidos da estimativa e sinalizados como análise parcial.
 - O módulo de hardlinks usa identificadores de arquivo fornecidos pelo SO; sistemas de arquivos específicos podem ter limitações, portanto nenhuma limpeza destrutiva é autorizada automaticamente.
+- O scanner não implementa ainda uma abertura de arquivos livre de condições de corrida (TOCTOU), nem garante que metadados Windows cubram todos os provedores de nuvem. Para segurança máxima, evite escanear pastas sincronizadas sensíveis até validar em Windows.
 - O scanner é assíncrono do ponto de vista da UI, mas ainda não implementa cancelamento, progresso incremental ou snapshot SQLite.
 - A leitura de saúde é Windows-only, e indicadores SMART podem estar ausentes (por modelo, driver, barramento ou privilégios). Um resultado `Healthy` não é garantia de ausência de falhas.
-- O módulo de otimização é Windows-only. Não força `-Defrag` em SSD, não eleva privilégios e não agenda tarefas automaticamente.
+- O módulo de otimização é Windows-only. Não força `-Defrag` em SSD, não eleva privilégios e não agenda tarefas automaticamente. O backend exige análise bem-sucedida da mesma unidade nos últimos 5 minutos, com autorização de uso único; análises simultâneas e operações concorrentes na mesma unidade são bloqueadas.
+- Em Windows, arquivos marcados como offline, recall-on-access ou reparse são listados por metadados, mas não têm conteúdo lido para hash; o relatório contabiliza candidatos ignorados. Essa política conservadora pode deixar duplicados não identificados.
+- O hash confere tamanho e data de modificação antes/depois da leitura, reduzindo resultados inconsistentes; não elimina condições de corrida do filesystem.
 - Funcionalidade de pré-visualização do impacto, métricas SMART, snapshot SQLite incremental, content-grep e tratamentos de hardlinks estão planejados.
 
 ## Comandos de qualidade
