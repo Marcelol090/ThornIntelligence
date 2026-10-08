@@ -21,6 +21,7 @@ pub struct IndexStats {
     pub skipped_directories: usize,
     pub completed_at_unix: i64,
     pub elapsed_ms: u128,
+    pub batches_written: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -28,6 +29,39 @@ pub struct IndexStats {
 pub struct IndexedSearch {
     pub report: SearchReport,
     pub completed_at_unix: i64,
+}
+
+const INDEX_BATCH_SIZE: usize = 1024;
+
+struct StagedFile {
+    path: String,
+    size: i64,
+    modified: i64,
+    flags: i64,
+}
+
+/// Durably spool at most 1024 metadata rows per WAL write transaction. The
+/// previously published snapshot remains readable while the walk is ongoing.
+fn flush_stage(conn: &mut Connection, root: &str, batch: &mut Vec<StagedFile>) -> Result<(), String> {
+    if batch.is_empty() { return Ok(()); }
+    let tx = conn.transaction().map_err(db_err)?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO indexed_stage(root,path,size_bytes,modified_ns,attributes)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(root,path) DO UPDATE SET
+                 size_bytes=excluded.size_bytes,
+                 modified_ns=excluded.modified_ns,
+                 attributes=excluded.attributes",
+        ).map_err(db_err)?;
+        for row in batch.iter() {
+            stmt.execute(params![root, row.path, row.size, row.modified, row.flags])
+                .map_err(db_err)?;
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    batch.clear();
+    Ok(())
 }
 
 fn db_err(err: impl std::fmt::Display) -> String {
@@ -85,62 +119,71 @@ pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
         );
         CREATE INDEX IF NOT EXISTS idx_indexed_files_generation
           ON indexed_files(root, generation, size_bytes DESC);
+        -- Incomplete staged rows are not referenced by the published scope.
+        CREATE TABLE IF NOT EXISTS indexed_stage (
+          root TEXT NOT NULL,
+          path TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          modified_ns INTEGER NOT NULL,
+          attributes INTEGER NOT NULL,
+          PRIMARY KEY(root,path)
+        );
     ").map_err(db_err)?;
     Ok(conn)
 }
 
-/// Metadata-only incremental refresh. No cloud file contents are opened.
-/// Every change and generation bump is one atomic transaction. Cancellation,
-/// errors, or file limits roll it back, preserving the last completed snapshot.
+/// Incrementally inventory metadata into bounded, durable SQLite WAL batches.
+/// Readers continue to see the previous completed snapshot throughout traversal.
+/// A separate, atomic publication transaction updates live rows only after every
+/// accessible directory/file has been processed successfully. An interrupted
+/// walk may leave unused staging rows; the next refresh discards those rows
+/// rather than treating a stale checkpoint as proof of current filesystem state.
 pub fn refresh(
     db_path: &Path,
     requested_root: &str,
-    max_files: usize,
+    max_files: Option<usize>,
     cancel: &AtomicBool,
     mut progress: impl FnMut(ScanProgress),
 ) -> Result<IndexStats, String> {
     let timer = Instant::now();
+    if max_files == Some(0) {
+        return Err("O limite de amostragem deve ser maior que zero.".into());
+    }
+    let source = std::fs::symlink_metadata(requested_root)
+        .map_err(|e| format!("Pasta não encontrada: {e}"))?;
+    if !source.is_dir() || is_reparse(&source) {
+        return Err("Selecione uma pasta local, não uma raiz redirecionada.".into());
+    }
     let root = std::fs::canonicalize(requested_root)
         .map_err(|e| format!("Pasta não encontrada: {e}"))?;
-    if !root.is_dir() { return Err("Selecione uma pasta.".into()); }
-    if is_reparse(&std::fs::symlink_metadata(&root).map_err(db_err)?) {
-        return Err("Raiz redirecionada/reparse não pode ser indexada.".into());
-    }
     let root_str = root.to_string_lossy().into_owned();
     let mut conn = connection(db_path)?;
-    let tx = conn.transaction().map_err(db_err)?;
-    let old_generation: i64 = tx.query_row(
+
+    // The previous snapshot is never modified until final publication.
+    // Cleanup of a canceled staging generation is safe and isolated by root.
+    conn.execute("DELETE FROM indexed_stage WHERE root=?1", params![root_str])
+        .map_err(db_err)?;
+    let old_generation: i64 = conn.query_row(
         "SELECT generation FROM indexed_scopes WHERE root = ?1",
         params![root_str], |row| row.get(0),
     ).optional().map_err(db_err)?.unwrap_or(0);
     let generation = old_generation.checked_add(1)
         .ok_or("Contador de gerações do índice esgotado.")?;
 
-    let mut lookup = tx.prepare_cached(
-        "SELECT size_bytes, modified_ns, attributes FROM indexed_files WHERE root=?1 AND path=?2"
-    ).map_err(db_err)?;
-    let mut upsert = tx.prepare_cached("
-      INSERT INTO indexed_files(root,path,size_bytes,modified_ns,attributes,generation)
-      VALUES(?1,?2,?3,?4,?5,?6)
-      ON CONFLICT(root,path) DO UPDATE SET
-        size_bytes=excluded.size_bytes,
-        modified_ns=excluded.modified_ns,
-        attributes=excluded.attributes,
-        generation=excluded.generation
-    ").map_err(db_err)?;
-    let limit = max_files.clamp(1, 1_000_000);
+    let mut batch = Vec::<StagedFile>::with_capacity(INDEX_BATCH_SIZE);
     let mut files = 0usize;
     let mut added = 0usize;
     let mut changed = 0usize;
     let mut unchanged = 0usize;
     let mut skipped_directories = 0usize;
+    let mut batches_written = 0usize;
     let mut last_event = Instant::now();
     progress(ScanProgress { phase: "indexing".into(), files_scanned: 0, hash_bytes_read: 0 });
 
     let mut walker = WalkDir::new(&root).follow_links(false).into_iter();
     while let Some(entry) = walker.next() {
         if cancel.load(Ordering::Relaxed) {
-            return Err("Indexação cancelada pelo usuário. Snapshot anterior preservado.".into());
+            return Err("Indexação cancelada; snapshot anterior preservado.".into());
         }
         let entry = entry.map_err(|e| format!("Índice não publicado: entrada inacessível: {e}"))?;
         if entry.path() == root { continue; }
@@ -153,10 +196,11 @@ pub fn refresh(
         }
         if entry.file_type().is_dir() { continue; }
         if !entry.file_type().is_file() { continue; }
-        if files >= limit {
-            return Err("Indexação excedeu o limite de arquivos; snapshot anterior preservado.".into());
+        // Do not turn an explicit sample into a misleading "complete" index.
+        if max_files.is_some_and(|limit| files >= limit) {
+            return Err("Amostragem interrompeu a indexação; snapshot anterior preservado.".into());
         }
-        // Never index our own changing WAL/SHM DB artefacts when scanning AppData.
+        // Never index the active SQLite database/WAL/SHM artefacts as they change.
         if entry.path() == db_path ||
             entry.path() == PathBuf::from(format!("{}-wal", db_path.display())) ||
             entry.path() == PathBuf::from(format!("{}-shm", db_path.display())) {
@@ -166,17 +210,28 @@ pub fn refresh(
         let size = i64::try_from(metadata.len()).map_err(db_err)?;
         let modified = mtime_ns(&metadata);
         let flags = i64::from(attributes(&metadata));
-        let prior: Option<(i64, i64, i64)> = lookup.query_row(
-            params![root_str, path], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        let prior: Option<(i64, i64, i64)> = conn.query_row(
+            "SELECT size_bytes,modified_ns,attributes FROM indexed_files WHERE root=?1 AND path=?2",
+            params![root_str, path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional().map_err(db_err)?;
         match prior {
             None => added += 1,
             Some(old) if old == (size, modified, flags) => unchanged += 1,
             Some(_) => changed += 1,
         }
-        upsert.execute(params![root_str, path, size, modified, flags, generation])
-            .map_err(db_err)?;
+        batch.push(StagedFile { path, size, modified, flags });
         files += 1;
+        if batch.len() == INDEX_BATCH_SIZE {
+            flush_stage(&mut conn, &root_str, &mut batch)?;
+            batches_written += 1;
+            // Every durable checkpoint emits progress, independently of the
+            // 250-ms timer. Tests and cancellation can reliably stop here.
+            progress(ScanProgress {
+                phase: "indexing".into(), files_scanned: files, hash_bytes_read: 0,
+            });
+            last_event = Instant::now();
+        }
         if last_event.elapsed() >= Duration::from_millis(250) {
             progress(ScanProgress {
                 phase: "indexing".into(), files_scanned: files, hash_bytes_read: 0,
@@ -184,13 +239,32 @@ pub fn refresh(
             last_event = Instant::now();
         }
     }
-    drop(lookup);
-    drop(upsert);
     if cancel.load(Ordering::Relaxed) {
-        return Err("Indexação cancelada pelo usuário. Snapshot anterior preservado.".into());
+        return Err("Indexação cancelada; snapshot anterior preservado.".into());
     }
-    // Rows absent from this generation become invisible to search and are
-    // pruned atomically. Reparse subtrees are deliberately outside the scope.
+    if !batch.is_empty() {
+        flush_stage(&mut conn, &root_str, &mut batch)?;
+        batches_written += 1;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Indexação cancelada; snapshot anterior preservado.".into());
+    }
+
+    // Publication still requires one atomic SQL transaction. For multi-million
+    // files this final merge can produce substantial WAL I/O; it does not hold
+    // a write transaction during the preceding, potentially hours-long walk.
+    let tx = conn.transaction().map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO indexed_files(root,path,size_bytes,modified_ns,attributes,generation)
+         SELECT root,path,size_bytes,modified_ns,attributes,?2
+         FROM indexed_stage WHERE root=?1 AND 1=1
+         ON CONFLICT(root,path) DO UPDATE SET
+             size_bytes=excluded.size_bytes,
+             modified_ns=excluded.modified_ns,
+             attributes=excluded.attributes,
+             generation=excluded.generation",
+        params![root_str, generation],
+    ).map_err(db_err)?;
     let removed = tx.execute(
         "DELETE FROM indexed_files WHERE root=?1 AND generation<>?2",
         params![root_str, generation],
@@ -199,18 +273,23 @@ pub fn refresh(
     tx.execute(
         "INSERT INTO indexed_scopes(root,generation,completed_at_unix,file_count)
          VALUES(?1,?2,?3,?4)
-         ON CONFLICT(root) DO UPDATE SET generation=excluded.generation,
-         completed_at_unix=excluded.completed_at_unix,file_count=excluded.file_count",
+         ON CONFLICT(root) DO UPDATE SET
+             generation=excluded.generation,
+             completed_at_unix=excluded.completed_at_unix,
+             file_count=excluded.file_count",
         params![root_str, generation, completed_at_unix, files as i64],
     ).map_err(db_err)?;
+    tx.execute("DELETE FROM indexed_stage WHERE root=?1", params![root_str])
+        .map_err(db_err)?;
     if cancel.load(Ordering::Relaxed) {
-        return Err("Indexação cancelada pelo usuário. Snapshot anterior preservado.".into());
+        return Err("Indexação cancelada; snapshot anterior preservado.".into());
     }
     tx.commit().map_err(db_err)?;
     progress(ScanProgress { phase: "complete".into(), files_scanned: files, hash_bytes_read: 0 });
     Ok(IndexStats {
         root: root_str, files, added, changed, unchanged, removed,
         skipped_directories, completed_at_unix, elapsed_ms: timer.elapsed().as_millis(),
+        batches_written,
     })
 }
 
@@ -286,13 +365,13 @@ mod tests {
         fs::write(root.join("a.txt"), "aa").unwrap();
         fs::write(root.join("b.txt"), "bbb").unwrap();
         let c = AtomicBool::new(false);
-        let first = refresh(&db, root.to_str().unwrap(), 100, &c, |_| {}).unwrap();
+        let first = refresh(&db, root.to_str().unwrap(), None, &c, |_| {}).unwrap();
         assert_eq!((first.added,first.changed,first.unchanged), (2,0,0));
-        let second = refresh(&db, root.to_str().unwrap(), 100, &c, |_| {}).unwrap();
+        let second = refresh(&db, root.to_str().unwrap(), None, &c, |_| {}).unwrap();
         assert_eq!((second.added,second.changed,second.unchanged), (0,0,2));
         fs::write(root.join("a.txt"), "longer payload").unwrap();
         fs::remove_file(root.join("b.txt")).unwrap();
-        let third = refresh(&db, root.to_str().unwrap(), 100, &c, |_| {}).unwrap();
+        let third = refresh(&db, root.to_str().unwrap(), None, &c, |_| {}).unwrap();
         assert_eq!((third.added,third.changed,third.removed), (0,1,1));
         let found = search_index(&db, SearchRequest {
             root: root.to_string_lossy().to_string(),
@@ -303,6 +382,68 @@ mod tests {
     }
 
     #[test]
+    fn batches_above_1024_rows_and_publishes_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("private/index.db");
+        let root = dir.path().join("scan");
+        fs::create_dir(&root).unwrap();
+        for i in 0..1035 {
+            fs::write(root.join(format!("{i:04}.txt")), b"content").unwrap();
+        }
+        let stats = refresh(&db, root.to_str().unwrap(), None,
+            &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(stats.files, 1035);
+        assert_eq!(stats.added, 1035);
+        assert_eq!(stats.batches_written, 2);
+        let conn = connection(&db).unwrap();
+        let live: i64 = conn.query_row("SELECT COUNT(*) FROM indexed_files", [], |r| r.get(0)).unwrap();
+        let staging: i64 = conn.query_row("SELECT COUNT(*) FROM indexed_stage", [], |r| r.get(0)).unwrap();
+        assert_eq!(live, 1035);
+        assert_eq!(staging, 0);
+    }
+
+    #[test]
+    fn cancellation_after_durable_batch_preserves_published_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let root = dir.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("original"), b"keep").unwrap();
+        let cancel = AtomicBool::new(false);
+        refresh(&db, root.to_str().unwrap(), None, &cancel, |_| {}).unwrap();
+        for i in 0..1050 {
+            fs::write(root.join(format!("new-{i:04}")), b"x").unwrap();
+        }
+        let result = refresh(&db, root.to_str().unwrap(), None, &cancel, |progress| {
+            if progress.files_scanned >= 1024 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        assert!(result.is_err());
+        let unchanged = search_index(&db, SearchRequest {
+            root: root.display().to_string(), regex: None,
+            min_size_bytes: None, max_files: None,
+        }).unwrap();
+        assert_eq!(unchanged.report.total_matches, 1);
+        // Restart performs a complete re-enumeration; staged data isn't
+        // mistaken for a valid filesystem snapshot.
+        cancel.store(false, Ordering::Relaxed);
+        let done = refresh(&db, root.to_str().unwrap(), None, &cancel, |_| {}).unwrap();
+        assert_eq!(done.files, 1051);
+    }
+
+    #[test]
+    fn rejects_explicit_truncated_index_instead_of_marking_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a"), "1").unwrap();
+        fs::write(root.join("b"), "2").unwrap();
+        assert!(refresh(&dir.path().join("idx.sqlite"), root.to_str().unwrap(),
+            Some(1), &AtomicBool::new(false), |_| {}).is_err());
+    }
+
+    #[test]
     fn cancel_does_not_publish_incomplete_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("scope");
@@ -310,10 +451,10 @@ mod tests {
         fs::write(root.join("a.bin"), "one").unwrap();
         let db = dir.path().join("idx.sqlite");
         let token = AtomicBool::new(false);
-        refresh(&db, root.to_str().unwrap(), 30, &token, |_| {}).unwrap();
+        refresh(&db, root.to_str().unwrap(), None, &token, |_| {}).unwrap();
         fs::write(root.join("b.bin"), "two").unwrap();
         token.store(true, Ordering::Relaxed);
-        assert!(refresh(&db, root.to_str().unwrap(), 30, &token, |_| {}).is_err());
+        assert!(refresh(&db, root.to_str().unwrap(), None, &token, |_| {}).is_err());
         let results = search_index(&db, SearchRequest {
             root: root.to_string_lossy().to_string(), regex: None,
             min_size_bytes: None, max_files: None,

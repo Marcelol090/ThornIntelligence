@@ -66,7 +66,7 @@ fn cancel_scan(job_id: String, jobs: State<'_, Arc<ScanJobs>>) -> Result<bool, S
 #[tauri::command]
 async fn refresh_index(
     root: String,
-    max_files: usize,
+    max_files: Option<usize>,
     job_id: String,
     on_progress: Channel<ScanProgress>,
     app: AppHandle,
