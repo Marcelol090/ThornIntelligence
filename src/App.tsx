@@ -415,6 +415,8 @@ export default function App() {
     } catch (err) {
       const message = String(err);
       if (message.includes('cancelada')) setToast('Indexação cancelada; último snapshot preservado.');
+      else if (message.includes('Conflito de indexação'))
+        setError('Outra instância atualizou este índice durante a análise. O snapshot mais recente foi preservado; execute Atualizar índice novamente.');
       else setError(message);
     } finally {
       if (activeJob.current === jobId) activeJob.current = null;
@@ -813,8 +815,9 @@ export default function App() {
               <button className="primary-button" type="submit" disabled={searchBusy || busy}>{searchBusy ? <LoaderCircle className="spin" size={17}/> : <Search size={17}/>} {searchBusy ? 'Buscando…' : 'Buscar'}</button>
             </form>
             <p className="panel-note"><Database size={14}/> Indexação sem teto artificial de arquivos.
-              Registros são gravados em lotes de até 1.024; o snapshot anterior continua
-              disponível até a atualização terminar. Cancelar não publica índices parciais.
+              Metadados são preparados em lotes temporários isolados de até 1.024 por instância;
+              o snapshot anterior continua disponível até a publicação atômica.
+              Atualizações concorrentes obsoletas são rejeitadas. Cancelar não publica índices parciais.
               Pausar/Retomar mantém a tarefa ativa sem publicar dados parciais.
               Após fechar o aplicativo, é necessária nova enumeração para validar mudanças.</p>
             <div className="index-tools">
@@ -830,7 +833,7 @@ export default function App() {
             </div>
             {indexStats && <p className="panel-note">Snapshot: {new Date(indexStats.completedAtUnix * 1000).toLocaleString('pt-BR')} ·
               {number(indexStats.files)} arquivos · {number(indexStats.added)} novos ·
-              {number(indexStats.changed)} alterados · {number(indexStats.removed)} removidos do índice · {number(indexStats.batchesWritten)} lotes SQLite gravados.
+              {number(indexStats.changed)} alterados · {number(indexStats.removed)} removidos do índice · {number(indexStats.batchesWritten)} lotes temporários processados.
               {indexStats.skippedDirectories > 0 ? ' Diretórios redirecionados excluídos: ' + number(indexStats.skippedDirectories) + '.' : ''}
             </p>}
             {cachedAt && <p className="panel-note">Resultados em cache de {new Date(cachedAt * 1000).toLocaleString('pt-BR')};

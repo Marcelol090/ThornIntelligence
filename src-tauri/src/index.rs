@@ -1,7 +1,7 @@
 use crate::scan::{FileResult, ScanProgress};
 use crate::search::{SearchReport, SearchRequest};
 use regex::RegexBuilder;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,14 +40,14 @@ struct StagedFile {
     flags: i64,
 }
 
-/// Durably spool at most 1024 metadata rows per WAL write transaction. The
-/// previously published snapshot remains readable while the walk is ongoing.
+/// Spool at most 1024 metadata rows per connection-private TEMP transaction.
+/// The previously published snapshot remains readable while the walk is ongoing.
 fn flush_stage(conn: &mut Connection, root: &str, batch: &mut Vec<StagedFile>) -> Result<(), String> {
     if batch.is_empty() { return Ok(()); }
     let tx = conn.transaction().map_err(db_err)?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO indexed_stage(root,path,size_bytes,modified_ns,attributes)
+            "INSERT INTO temp.indexed_stage_session(root,path,size_bytes,modified_ns,attributes)
              VALUES(?1,?2,?3,?4,?5)
              ON CONFLICT(root,path) DO UPDATE SET
                  size_bytes=excluded.size_bytes,
@@ -119,15 +119,6 @@ pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
         );
         CREATE INDEX IF NOT EXISTS idx_indexed_files_generation
           ON indexed_files(root, generation, size_bytes DESC);
-        -- Incomplete staged rows are not referenced by the published scope.
-        CREATE TABLE IF NOT EXISTS indexed_stage (
-          root TEXT NOT NULL,
-          path TEXT NOT NULL,
-          size_bytes INTEGER NOT NULL,
-          modified_ns INTEGER NOT NULL,
-          attributes INTEGER NOT NULL,
-          PRIMARY KEY(root,path)
-        );
     ").map_err(db_err)?;
     Ok(conn)
 }
@@ -160,12 +151,12 @@ fn wait_indexer(
     Ok(())
 }
 
-/// Incrementally inventory metadata into bounded, durable SQLite WAL batches.
+/// Incrementally inventory metadata into bounded connection-private TEMP batches.
 /// Readers continue to see the previous completed snapshot throughout traversal.
 /// A separate, atomic publication transaction updates live rows only after every
 /// accessible directory/file has been processed successfully. An interrupted
-/// walk may leave unused staging rows; the next refresh discards those rows
-/// rather than treating a stale checkpoint as proof of current filesystem state.
+/// walk discards its connection-private stage on close; a new refresh must
+/// enumerate the filesystem again rather than trusting interrupted work.
 pub fn refresh(
     db_path: &Path,
     requested_root: &str,
@@ -188,10 +179,19 @@ pub fn refresh(
     let root_str = root.to_string_lossy().into_owned();
     let mut conn = connection(db_path)?;
 
-    // The previous snapshot is never modified until final publication.
-    // Cleanup of a canceled staging generation is safe and isolated by root.
-    conn.execute("DELETE FROM indexed_stage WHERE root=?1", params![root_str])
-        .map_err(db_err)?;
+    // A TEMP table belongs to this connection only. Two application processes
+    // can stage the same root without overwriting each other's rows. Staging
+    // vanishes on close/crash and cannot be mistaken for a published snapshot.
+    conn.execute_batch("
+        CREATE TEMP TABLE indexed_stage_session (
+          root TEXT NOT NULL,
+          path TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          modified_ns INTEGER NOT NULL,
+          attributes INTEGER NOT NULL,
+          PRIMARY KEY(root,path)
+        );
+    ").map_err(db_err)?;
     let old_generation: i64 = conn.query_row(
         "SELECT generation FROM indexed_scopes WHERE root = ?1",
         params![root_str], |row| row.get(0),
@@ -277,15 +277,22 @@ pub fn refresh(
         return Err("Indexação cancelada; snapshot anterior preservado.".into());
     }
 
-    // Publication still requires one atomic SQL transaction. For multi-million
-    // files this final merge can produce substantial WAL I/O; it does not hold
-    // a write transaction during the preceding, potentially hours-long walk.
+    // Only the final publication writes the shared database. BEGIN IMMEDIATE
+    // serializes publishers across processes; the generation check prevents a
+    // stale scan from replacing a newer completed snapshot.
     wait_indexer(paused, cancel, files, &mut progress)?;
-    let tx = conn.transaction().map_err(db_err)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_err)?;
+    let current_generation: i64 = tx.query_row(
+        "SELECT generation FROM indexed_scopes WHERE root=?1",
+        params![root_str], |row| row.get(0),
+    ).optional().map_err(db_err)?.unwrap_or(0);
+    if current_generation != old_generation {
+        return Err("Conflito de indexação: outra instância publicou um snapshot mais recente. Atualize novamente para reconciliar.".into());
+    }
     tx.execute(
         "INSERT INTO indexed_files(root,path,size_bytes,modified_ns,attributes,generation)
          SELECT root,path,size_bytes,modified_ns,attributes,?2
-         FROM indexed_stage WHERE root=?1 AND 1=1
+         FROM temp.indexed_stage_session WHERE root=?1 AND 1=1
          ON CONFLICT(root,path) DO UPDATE SET
              size_bytes=excluded.size_bytes,
              modified_ns=excluded.modified_ns,
@@ -307,8 +314,6 @@ pub fn refresh(
              file_count=excluded.file_count",
         params![root_str, generation, completed_at_unix, files as i64],
     ).map_err(db_err)?;
-    tx.execute("DELETE FROM indexed_stage WHERE root=?1", params![root_str])
-        .map_err(db_err)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("Indexação cancelada; snapshot anterior preservado.".into());
     }
@@ -336,15 +341,18 @@ pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSea
             .map_err(|e| format!("Regex inválida: {e}"))?),
         None => None,
     };
-    let conn = connection(db_path)?;
-    let (generation, completed_at_unix): (i64, i64) = conn.query_row(
+    let mut conn = connection(db_path)?;
+    // Read scope metadata and its rows from one WAL snapshot, even if a
+    // different process publishes a new generation during this search.
+    let tx = conn.transaction().map_err(db_err)?;
+    let (generation, completed_at_unix): (i64, i64) = tx.query_row(
         "SELECT generation,completed_at_unix FROM indexed_scopes WHERE root=?1",
         params![root], |row| Ok((row.get(0)?, row.get(1)?)),
     ).optional().map_err(db_err)?
         .ok_or("Esta pasta ainda não possui snapshot completo. Use Atualizar índice.")?;
     let min_size = i64::try_from(request.min_size_bytes.unwrap_or(0))
         .map_err(|_| "Tamanho mínimo fora do intervalo.")?;
-    let mut stmt = conn.prepare(
+    let mut stmt = tx.prepare(
         "SELECT path,size_bytes FROM indexed_files
          WHERE root=?1 AND generation=?2 AND size_bytes>=?3"
     ).map_err(db_err)?;
@@ -368,6 +376,9 @@ pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSea
         top.insert((size_bytes, path.clone()), FileResult { name, path, size_bytes, extension });
         if top.len() > 500 { top.pop_first(); }
     }
+    drop(rows);
+    drop(stmt);
+    tx.commit().map_err(db_err)?;
     Ok(IndexedSearch {
         report: SearchReport {
             root, files_scanned: candidates, total_matches: total,
@@ -425,9 +436,79 @@ mod tests {
         assert_eq!(stats.batches_written, 2);
         let conn = connection(&db).unwrap();
         let live: i64 = conn.query_row("SELECT COUNT(*) FROM indexed_files", [], |r| r.get(0)).unwrap();
-        let staging: i64 = conn.query_row("SELECT COUNT(*) FROM indexed_stage", [], |r| r.get(0)).unwrap();
+        let legacy_stage_tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='indexed_stage'",
+            [], |r| r.get(0),
+        ).unwrap();
         assert_eq!(live, 1035);
-        assert_eq!(staging, 0);
+        assert_eq!(legacy_stage_tables, 0);
+    }
+
+    #[test]
+    fn competing_refreshes_cannot_publish_each_others_staged_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let root = dir.path().join("scan");
+        fs::create_dir(&root).unwrap();
+        for i in 0..(INDEX_BATCH_SIZE + 8) {
+            fs::write(root.join(format!("item-{i:04}.bin")), b"x").unwrap();
+        }
+        let mut competing_refresh_completed = false;
+        let first = refresh(&db, root.to_str().unwrap(), None,
+            &AtomicBool::new(false), &AtomicBool::new(false), |event| {
+                if event.phase == "indexing"
+                    && event.files_scanned == INDEX_BATCH_SIZE
+                    && !competing_refresh_completed
+                {
+                    let newer = refresh(&db, root.to_str().unwrap(), None,
+                        &AtomicBool::new(false), &AtomicBool::new(false), |_| {}).unwrap();
+                    assert_eq!(newer.files, INDEX_BATCH_SIZE + 8);
+                    competing_refresh_completed = true;
+                }
+            });
+        assert!(competing_refresh_completed);
+        assert!(first.unwrap_err().contains("Conflito de indexação"));
+        let published = search_index(&db, SearchRequest {
+            root: root.display().to_string(), regex: None,
+            min_size_bytes: None, max_files: None,
+        }).unwrap();
+        assert_eq!(published.report.total_matches, INDEX_BATCH_SIZE + 8);
+        let conn = connection(&db).unwrap();
+        let (generation, count): (i64, i64) = conn.query_row(
+            "SELECT generation,file_count FROM indexed_scopes WHERE root=?1",
+            params![root.display().to_string()], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!((generation, count), (1, (INDEX_BATCH_SIZE + 8) as i64));
+    }
+
+    #[test]
+    fn read_transaction_keeps_generation_and_rows_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let root = dir.path().join("scan");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("old.txt"), "old").unwrap();
+        refresh(&db, root.to_str().unwrap(), None,
+            &AtomicBool::new(false), &AtomicBool::new(false), |_| {}).unwrap();
+        let mut reader = connection(&db).unwrap();
+        let tx = reader.transaction().unwrap();
+        let generation: i64 = tx.query_row(
+            "SELECT generation FROM indexed_scopes WHERE root=?1",
+            params![root.display().to_string()], |r| r.get(0),
+        ).unwrap();
+        fs::write(root.join("new.txt"), "new").unwrap();
+        refresh(&db, root.to_str().unwrap(), None,
+            &AtomicBool::new(false), &AtomicBool::new(false), |_| {}).unwrap();
+        let snapshot_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM indexed_files WHERE root=?1 AND generation=?2",
+            params![root.display().to_string(), generation], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(snapshot_count, 1);
+        tx.commit().unwrap();
+        assert_eq!(search_index(&db, SearchRequest {
+            root: root.display().to_string(), regex: None,
+            min_size_bytes: None, max_files: None,
+        }).unwrap().report.total_matches, 2);
     }
 
     #[test]
