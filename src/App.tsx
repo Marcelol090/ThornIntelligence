@@ -9,7 +9,7 @@ import {
   Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu, ArchiveRestore, CloudOff,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { IndexStats, IndexedSearch, QuarantinePreview, QuarantineItem, CompareReport, CompareRequest, AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
+import type { IndexStats, IndexedSearch, QuarantinePreview, QuarantineItem, QuarantineAuditReport, CompareReport, CompareRequest, AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -132,6 +132,8 @@ export default function App() {
   const [moveConfirmation, setMoveConfirmation] = useState('');
   const [restoreConfirmation, setRestoreConfirmation] = useState('');
   const [quarantineBusy, setQuarantineBusy] = useState(false);
+  const [auditBusy, setAuditBusy] = useState(false);
+  const [quarantineAudit, setQuarantineAudit] = useState<QuarantineAuditReport | null>(null);
   const [mobileMenu, setMobileMenu] = useState(false);
   const [windowEffectStatus, setWindowEffectStatus] = useState<'pending' | 'requested' | 'failed'>('pending');
   const [windowEffectError, setWindowEffectError] = useState('');
@@ -432,7 +434,7 @@ export default function App() {
   }
 
   async function pickQuarantineFile() {
-    if (quarantineBusy) return;
+    if (quarantineBusy || auditBusy) return;
     try {
       const path = await open({ directory: false, multiple: false,
         title: 'Escolha um arquivo local para pré-visualizar' });
@@ -449,8 +451,25 @@ export default function App() {
     } catch (err) { setError('Não foi possível listar a quarentena: ' + String(err)); }
   }
 
+  async function auditQuarantine() {
+    if (auditBusy || quarantineBusy) return;
+    setError('');
+    setAuditBusy(true);
+    setQuarantineAudit(null);
+    try {
+      const result = await invoke<QuarantineAuditReport>('audit_quarantine');
+      setQuarantineAudit(result);
+      setToast('Auditoria concluída: ' + number(result.issues.length)
+        + ' divergências' + (result.truncated ? ' (resultado parcial).' : '.'));
+    } catch (err) {
+      setError('Não foi possível auditar a quarentena: ' + String(err));
+    } finally {
+      setAuditBusy(false);
+    }
+  }
+
   async function previewQuarantine() {
-    if (quarantineBusy) return;
+    if (quarantineBusy || auditBusy) return;
     setError(''); setPreview(null); setMoveConfirmation(''); setQuarantineBusy(true);
     try {
       const next = await invoke<QuarantinePreview>('preview_quarantine', { path: quarantinePath });
@@ -460,7 +479,8 @@ export default function App() {
   }
 
   async function moveToQuarantine() {
-    if (quarantineBusy || !preview || moveConfirmation !== 'MOVER PARA QUARENTENA') return;
+    if (quarantineBusy || auditBusy || !preview || moveConfirmation !== 'MOVER PARA QUARENTENA') return;
+    setQuarantineAudit(null);
     setError(''); setQuarantineBusy(true);
     try {
       await invoke<QuarantineItem>('quarantine_file', {
@@ -478,7 +498,8 @@ export default function App() {
   }
 
   async function restoreQuarantine(id: string) {
-    if (quarantineBusy || restoreConfirmation !== 'RESTAURAR') return;
+    if (quarantineBusy || auditBusy || restoreConfirmation !== 'RESTAURAR') return;
+    setQuarantineAudit(null);
     setError(''); setQuarantineBusy(true);
     try {
       await invoke<QuarantineItem>('restore_quarantine', {
@@ -902,6 +923,52 @@ export default function App() {
             </div>)}
             {!quarantined.length && <p className="panel-note">Nenhum arquivo recuperável listado neste computador.</p>}
             <p className="panel-note">Não há purga, retenção automática ou liberação física de espaço nesta versão.</p>
+          </section>
+          <section className="panel glass" aria-label="Auditoria de integridade da quarentena">
+            <SectionHeading kicker="RECONCILIAÇÃO SOMENTE LEITURA" title="Integridade da quarentena"
+              description="Compare o manifesto SQLite e os arquivos gerenciados para encontrar movimentações interrompidas e divergências. Nenhum arquivo é aberto, restaurado ou excluído."
+              right={<button type="button" className="outline-button"
+                disabled={auditBusy || quarantineBusy} onClick={() => void auditQuarantine()}>
+                {auditBusy ? <LoaderCircle size={16} className="spin"/> : <ShieldCheck size={16}/>}
+                {auditBusy ? 'Auditando…' : 'Auditar agora'}
+              </button>}/>
+            {quarantineAudit && <>
+              <p className="panel-note" role="status">
+                {number(quarantineAudit.checkedEntries)} registros e {number(quarantineAudit.checkedFiles)} entradas conferidos.
+                {' '}{number(quarantineAudit.pendingEntries)} pendentes ·
+                {' '}{number(quarantineAudit.missingFiles)} ausentes ·
+                {' '}{number(quarantineAudit.changedFiles)} alterados ·
+                {' '}{number(quarantineAudit.orphanFiles)} órfãos ·
+                {' '}{number(quarantineAudit.unexpectedFiles)} inesperados.
+              </p>
+              {quarantineAudit.truncated && <div className="alert warning-alert">
+                <Info size={18}/><span>Auditoria parcial: limite de 5.000 registros/arquivos atingido.
+                  Não interpretar os totais como inventário completo.</span>
+              </div>}
+              {!quarantineAudit.truncated && quarantineAudit.issues.length === 0 &&
+                <p className="panel-note">Nenhuma divergência de manifesto/tamanho encontrada nos itens consultados.
+                  Isso não verifica o conteúdo nem garante uma restauração.</p>}
+              <div className="quarantine-audit-issues">
+                {quarantineAudit.issues.slice(0, 50).map((issue, i) =>
+                  <div className="quarantine-audit-item" key={issue.id + '-' + i}>
+                    <strong>{issue.kind === 'pending' ? 'Movimento pendente' :
+                      issue.kind === 'missing' ? 'Arquivo ausente' :
+                      issue.kind === 'orphan' ? 'Arquivo sem manifesto' :
+                      issue.kind === 'changed' ? 'Arquivo divergente' :
+                      issue.kind === 'invalid_id' ? 'Identificador inválido' :
+                      'Estado inesperado'}</strong>
+                    <small title={issue.id}>ID: {issue.id}</small>
+                    {issue.originalPath && <small title={issue.originalPath}>
+                      Origem: {truncatePath(issue.originalPath, 100)}</small>}
+                    <p>{issue.details}</p>
+                  </div>)}
+                {quarantineAudit.issues.length > 50 && <p className="panel-note">
+                  Exibindo 50 de {number(quarantineAudit.issues.length)} divergências;
+                  consulte os registros restantes antes de qualquer restauração.</p>}
+              </div>
+              <p className="panel-note">Auditoria apenas informativa. Não corrige registros,
+                não recupera dados e não garante a integridade do conteúdo.</p>
+            </>}
           </section>
         </div>}
 

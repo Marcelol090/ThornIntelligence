@@ -344,3 +344,11 @@ html.native-vibrancy .glass-inset{
 .quarantine-item small{font-size:11px;color:#9caec1}
 .quarantine-item .outline-button{flex-shrink:0;display:inline-flex;align-items:center;gap:6px}
 @media(max-width:630px){.quarantine-item{align-items:stretch;flex-direction:column}.quarantine-item .outline-button{justify-content:center}}
+
+/* Read-only quarantine journal reconciliation: do not style these as actionable restore controls. */
+.quarantine-audit-issues{display:grid;gap:10px;margin:15px 0}
+.quarantine-audit-item{display:grid;gap:5px;padding:13px 15px;background:rgba(62,79,112,.19);
+  border:1px solid rgba(178,197,228,.2);border-radius:10px;min-width:0}
+.quarantine-audit-item strong{font-size:12px;color:#f4c58e}
+.quarantine-audit-item small{font-size:10px;line-height:1.5;color:#93aac3;overflow-wrap:anywhere}
+.quarantine-audit-item p{font-size:11px;line-height:1.55;color:#c9d5e3;margin:2px 0 0}

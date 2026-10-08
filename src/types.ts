@@ -185,6 +185,25 @@ export interface QuarantinePreview {
   sizeBytes: number;
   warning: string;
 }
+/** Read-only inspection of the SQLite journal and local quarantine directory. */
+export interface QuarantineAuditIssue {
+  id: string;
+  originalPath: string | null;
+  kind: 'pending' | 'missing' | 'orphan' | 'unexpected' | 'changed' | 'invalid_id';
+  details: string;
+}
+export interface QuarantineAuditReport {
+  checkedEntries: number;
+  checkedFiles: number;
+  missingFiles: number;
+  orphanFiles: number;
+  pendingEntries: number;
+  unexpectedFiles: number;
+  changedFiles: number;
+  truncated: boolean;
+  issues: QuarantineAuditIssue[];
+}
+
 export interface QuarantineItem {
   id: string;
   originalPath: string;
