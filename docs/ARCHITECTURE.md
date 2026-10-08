@@ -15,8 +15,14 @@ React/Tauri Window
  │         ├── metadados e somatórios de diretórios
  │         ├── Regex de caminho e filtro de tamanho
  │         ├── grupos candidatos por tamanho
- │         └── BLAKE3 de conteúdo (até 8 GiB lidos)
+ │         ├── guarda contra atributos Windows offline/reparse/recall
+ │         ├── BLAKE3 de conteúdo (até 8 GiB lidos; metadados revalidados)
+ │         └── identidade do arquivo (same-file) para descartar hardlinks
+ ├── search_path({root,regex,minSizeBytes,maxFiles}) — enumeração de metadados,
+ │    sem abrir conteúdo nem recalcular BLAKE3; ranking limitado a 500 itens
+ ├── disk_health({drive}) — Windows Storage read-only
  └── optimize_volume({drive,execute})
+      ├── gate Rust por unidade (análise aprovada, TTL 5 min, uso único)
       └── Windows PowerShell > Optimize-Volume
            ├── execute=false: -Analyze
            └── execute=true: modo automático do Windows
@@ -27,12 +33,14 @@ O frontend recebe relatórios serializados (camelCase) e apresenta **apenas info
 ### Segurança operacional
 
 - Não implementar exclusão silenciosa, deduplicação via hardlink ou limpeza de cache sem revisão e opt-in.
-- Exigir confirmação explícita para toda operação modificadora. Modo análise nunca otimiza.
+- Exigir confirmação explícita para toda operação modificadora. Modo análise nunca otimiza. O backend mantém estado de análise por unidade com expiração e consumo único, sem confiar exclusivamente na UI.
 - Usar `Command::new` com argumentos fixos, aceitando apenas uma letra ASCII de unidade.
 - Deixar o sistema operacional identificar HDD/SSD/tiers; não usar `-Defrag` indiscriminadamente.
 - Respeitar privilégios do usuário e mostrar falhas de permissão.
 - Não seguir junctions/symlinks durante a varredura nem atravessar outros destinos intencionalmente por links.
 - Não afirmar economia física: APFS/NTFS sparse/reparse/hardlinks/compressão alteram cálculo real.
+- Descartar hardlink aliases na estimativa com verificação de identidade via `same-file`; impor limite de descritores e marcar grupos não verificados como parciais.
+- Antes de ler conteúdo no Windows, excluir do hash arquivos com atributos offline, recall-on-open, recall-on-data-access e reparse; revalidar metadados após a leitura. O relatório explicita candidatos omitidos. TOCTOU e outros provedores de nuvem ainda requerem testes específicos.
 - Não declarar duplicação por nome/tamanho/partial hash apenas: o candidato exige digest integral; hashes são uma evidência forte, não verificação byte a byte para situações adversariais.
 - Sem comandos genéricos digitados pelo usuário, sem execução remota.
 
@@ -40,8 +48,10 @@ O frontend recebe relatórios serializados (camelCase) e apresenta **apenas info
 
 - `src/App.tsx`: navegação, estados, busca, tabelas, ações explícitas, comunicação Tauri.
 - `src/styles.css`: tokens visuais dark/glass, backdrop-filter, breakpoints, foco visível e reduced motion.
-- `src-tauri/src/scan.rs`: algoritmo de varredura/agrupamento e testes.
+- `src-tauri/src/scan.rs`: algoritmo de varredura/agrupamento e testes; contador de bytes retornados por leituras exitosas, inclusive de hashes interrompidos por erros.
+- `src-tauri/src/search.rs`: pesquisa por metadados independente de hashing, com ranking limitado e limite de 4.096 bytes de Regex.
 - `src-tauri/src/optimize.rs`: adaptador nativo Windows e validação da letra da unidade.
+- `src-tauri/src/health.rs`: diagnóstico de capacidade e confiabilidade por comandos Windows de leitura, com sensores opcionais.
 - `src-tauri/src/lib.rs`: fronteira IPC; tarefas que leem disco ficam fora do thread principal.
 
 ## Decisões seguintes
@@ -68,3 +78,32 @@ O frontend recebe relatórios serializados (camelCase) e apresenta **apenas info
 - Segurança: zero mutações inesperadas, zero acesso à rede, operação abortável e auditável.
 
 Sem benchmark antes/depois, não afirmar superioridade numérica.
+
+## Evidências externas para roadmap (pesquisa Exa, 08/10/2026)
+
+- [Microsoft Learn: Optimize-Volume](https://learn.microsoft.com/en-us/powershell/module/storage/optimize-volume?view=windowsserver2025-ps): operações nativas dependem do tipo de volume/mídia. Evitar desfragmentação indiscriminada em SSD.
+- [Microsoft Learn: Get-StorageReliabilityCounter](https://learn.microsoft.com/en-us/powershell/module/storage/get-storagereliabilitycounter?view=windowsserver2025-ps): temperatura, desgaste, erros e horas de uso dependem de suporte do dispositivo/driver; valores ausentes devem permanecer indisponíveis.
+- [WinDirStat #340](https://github.com/windirstat/windirstat/issues/340) e [#108](https://github.com/windirstat/windirstat/issues/108): preocupações concretas com hardlinks e contabilidade de espaço físico.
+- [Microsoft Q&A — hidden / unknown space](https://learn.microsoft.com/en-us/answers/questions/1688633/mismatch-of-used-disk-space-unknown-files-in-windi): demanda por explicação de diferenças entre alocação física e soma lógica; planejar diagnóstico de NTFS, VSS, metadados, permissões e arquivos especiais.
+- [rsdirstat: cloud placeholders](https://github.com/rikshot/rsdirstat/commit/1faa0b3d1cc8b5dfb968ab598c127a8daf45898b): arquivos de nuvem sob demanda e reparse points exigem tratamento especial de tamanho alocado e recursão.
+
+## Ciclo de segurança: autorização de otimização e hidratação de arquivos (08/10/2026)
+
+- Uma análise bem-sucedida gera autorização **somente na memória do processo Rust**, associada à letra da unidade, com expiração de cinco minutos. A autorização é consumida antes de chamar o comando modificador; falha de análise ou nova análise a revoga. Isso impede que o frontend invoque a otimização diretamente sem diagnóstico prévio, mas não substitui confirmação humana e backups.
+- A política conservadora de hash evita abrir arquivos marcados como offline, reparse ou recall-on-access no Windows. Metadados continuam visíveis na árvore. Condições de corrida entre metadados e abertura ainda existem; o produto não afirma proteção absoluta contra hidratação.
+- Evidência de dor real: [WinDirStat #416](https://github.com/windirstat/windirstat/issues/416), downloads involuntários durante navegação de diretórios OneDrive.
+- Fontes oficiais: [Optimize-Volume](https://learn.microsoft.com/en-us/powershell/module/storage/optimize-volume) (política por tipo de mídia) e [Get-StorageReliabilityCounter](https://learn.microsoft.com/en-us/powershell/module/storage/get-storagereliabilitycounter) (sensores dependentes de suporte do hardware).
+
+### Testes ainda necessários em Windows
+
+1. Rejeitar `execute=true` sem análise, após 5 minutos, em outra unidade ou depois de uma execução; testar falha e concorrência.
+2. Verificar com Files On-Demand do OneDrive que pastas e placeholders aparecem no inventário sem download durante hash.
+3. Testar troca/modificação de arquivo enquanto ocorre BLAKE3; relatório deve indicar resultado parcial.
+4. Executar testes Rust, frontend e integração em volume descartável. CI atual está bloqueado e não fornece evidência de aprovação.
+
+## Revisão do orçamento de hashing e busca (08/10/2026)
+
+- A leitura de cada candidato para BLAKE3 permanece sequencial e limitada ao tamanho do metadado inicial. Mesmo se uma leitura posterior falhar, bytes já recebidos contam no orçamento de 8 GiB. O relatório não confunde esse contador de payload retornado com I/O físico medido por SMART ou pelo controlador.
+- O scanner e a pesquisa têm limite de tamanho de Regex no backend (4.096 bytes), compilação com tamanho máximo de programa Regex e contagem explícita de correspondências.
+- O scanner mantém apenas 500 correspondências de busca em memória; o inventário de arquivos da varredura completa continua em memória e será substituído por indexação persistente em fase posterior.
+- O build local e CI Windows devem passar antes de afirmar homologação; a conta GitHub Actions pode impedir a inicialização dos jobs por condição de faturamento.
