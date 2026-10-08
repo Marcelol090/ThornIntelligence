@@ -11,7 +11,7 @@ mod search;
 use allocation::{AllocationReport, AllocationRequest};
 use compare::{CompareReport, CompareRequest};
 use health::DiskHealth;
-use index::{IndexStats, IndexedSearch};
+use index::{IndexStats, IndexedSearch, TreePage, TreeRequest};
 use quarantine::{QuarantineGate, QuarantineItem, QuarantinePreview};
 use jobs::ScanJobs;
 use optimize::OptimizationResult;
@@ -152,6 +152,14 @@ async fn search_index(request: SearchRequest, app: AppHandle)
 }
 
 #[tauri::command]
+async fn browse_index_tree(request: TreeRequest, app: AppHandle) -> Result<TreePage, String> {
+    let app_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        index::browse_tree(&app_data.join("storage-index.sqlite"), request)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn preview_quarantine(
     path: String, app: AppHandle, gate: State<'_, Arc<QuarantineGate>>,
 ) -> Result<QuarantinePreview, String> {
@@ -218,7 +226,7 @@ pub fn run() {
         .manage(Arc::new(ScanJobs::default()))
         .manage(Arc::new(QuarantineGate::default()))
         .invoke_handler(tauri::generate_handler![scan_path, search_path, compare_folders, measure_allocated_sizes, cancel_scan,
-            pause_index, resume_index, refresh_index, search_index,
+            pause_index, resume_index, refresh_index, search_index, browse_index_tree,
             preview_quarantine, quarantine_file, list_quarantine, restore_quarantine,
             optimize_volume, disk_health])
         .run(tauri::generate_context!())
