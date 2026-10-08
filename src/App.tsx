@@ -103,6 +103,7 @@ export default function App() {
   const [cancelRequested, setCancelRequested] = useState(false);
   const [busy, setBusy] = useState(false);
   const [includeDuplicates, setIncludeDuplicates] = useState(false);
+  const [hashBudget, setHashBudget] = useState<'standard' | 'deep' | 'unlimited'>('standard');
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const [regex, setRegex] = useState('');
@@ -208,7 +209,12 @@ export default function App() {
     try {
       const parsed = Number(min);
       if (!Number.isFinite(parsed) || parsed < 0) throw new Error('Tamanho mínimo inválido.');
-      const request: ScanRequest = { root: path, regex: pattern.trim() || null, minSizeBytes: Math.floor(parsed * 1024 * 1024), analyzeDuplicates: analyze };
+      const request: ScanRequest = {
+        root: path, regex: pattern.trim() || null,
+        minSizeBytes: Math.floor(parsed * 1024 * 1024),
+        analyzeDuplicates: analyze,
+        hashBudget: analyze ? hashBudget : undefined,
+      };
       const result = await invoke<ScanReport>('scan_path', { request, jobId, onProgress });
       setReport(result);
       setSearchResult(null);
@@ -582,8 +588,18 @@ export default function App() {
             <label className="scan-hash-option" title="Modo rápido: só inventário. Ative para detectar duplicados por BLAKE3.">
               <input type="checkbox" checked={includeDuplicates} disabled={busy || searchBusy || indexBusy}
                 onChange={event => setIncludeDuplicates(event.target.checked)}/>
-              <span>Incluir BLAKE3 <small>{includeDuplicates ? 'Varredura completa (mais I/O)' : 'Desativado: modo rápido'}</small></span>
+              <span>Incluir BLAKE3 <small>{includeDuplicates ? 'Verificação completa dos candidatos' : 'Desativado: modo rápido'}</small></span>
             </label>
+            {includeDuplicates && <label className="hash-budget-option">
+              <span>Limite de leitura BLAKE3</span>
+              <select aria-label="Limite de leitura BLAKE3" value={hashBudget}
+                disabled={busy || searchBusy || allocationBusy || compareBusy || indexBusy}
+                onChange={event => setHashBudget(event.target.value as 'standard' | 'deep' | 'unlimited')}>
+                <option value="standard">Equilibrado — 8 GiB</option>
+                <option value="deep">Profundo — 64 GiB</option>
+                <option value="unlimited">Sem limite — I/O intenso</option>
+              </select>
+            </label>}
             <button className="primary-button" disabled={busy || searchBusy || allocationBusy || compareBusy || indexBusy} onClick={() => void scanFolder()}>{busy ? <LoaderCircle className="spin" size={18}/> : <FolderOpen size={18}/>} {busy ? 'Analisando…' : 'Analisar pasta'} <ArrowRight size={16}/></button>
           </div>
         </div>
@@ -639,8 +655,20 @@ export default function App() {
             <Metric label="Volume analisado" value={bytes(report.logicalBytes)} helper="Tamanho lógico dos arquivos" icon={Database}/>
             <Metric label="Arquivos analisados" value={number(report.filesScanned)} helper={number(report.directoriesScanned) + ' diretórios percorridos'} icon={FileSearch} tone="violet"/>
             <Metric label="Espaço duplicado" value={report.hashingSkipped ? '—' : bytes(report.potentialSavingsBytes)} helper={report.hashingSkipped ? 'BLAKE3 ainda não executado' : 'Estimativa, sem exclusões'} icon={Fingerprint} tone="mint"/>
-            <Metric label="Grupos duplicados" value={report.hashingSkipped ? '—' : number(report.duplicates.length)} helper={report.hashingSkipped ? 'Ative o modo completo' : bytes(report.hashBytesRead) + ' lidos por hash'} icon={Layers3} tone="pink"/>
+            <Metric label="Grupos duplicados" value={report.hashingSkipped ? '—' : number(report.duplicates.length)} helper={report.hashingSkipped ? 'Ative o modo completo' : bytes(report.hashBytesRead) + ' lidos (amostras + hash)'} icon={Layers3} tone="pink"/>
           </div>
+          {!report.hashingSkipped && <p className="hash-benchmark glass" role="status">
+            <Fingerprint size={15}/>
+            <span><strong>Diagnóstico BLAKE3:</strong>
+              {' '}amostras {bytes(report.fingerprintBytesRead)} em {duration(report.fingerprintElapsedMs)} ·
+              {' '}hash integral {bytes(report.fullHashBytesRead)} em {duration(report.fullHashElapsedMs)}
+              {report.fullHashElapsedMs > 0 && report.fullHashBytesRead > 0
+                ? ' (' + (report.fullHashBytesRead / 1048576 / (report.fullHashElapsedMs / 1000)).toFixed(1) + ' MiB/s de leitura + hash'
+                : ''}
+              {' '}· teto: {report.hashReadBudgetBytes === null ? 'sem limite' : bytes(report.hashReadBudgetBytes)}.
+              {' '}Valores medidos pelo aplicativo; não são velocidade física do disco.
+            </span>
+          </p>}
           <div className="dashboard-grid">
             <section className="panel glass">
               <SectionHeading kicker="MAPA DE CONSUMO" title="Maiores diretórios" right={<button className="text-button" onClick={() => selectSection('explorer')}>Ver todos <ArrowRight size={16}/></button>}/>
@@ -765,7 +793,7 @@ export default function App() {
               <Metric label="Arquivos na pasta mestre" value={number(comparison.referenceFiles)}
                 helper="Somente leitura" icon={FolderOpen} tone="violet"/>
               <Metric label="Leituras de hash" value={bytes(comparison.hashBytesRead)}
-                helper="Limite de até 8 GiB" icon={Gauge} tone="pink"/>
+                helper={'Etapa BLAKE3: ' + duration(comparison.hashStageElapsedMs) + ' · orçamento de 8 GiB'} icon={Gauge} tone="pink"/>
             </div>
             {!comparison.complete && <div className="alert warning-alert" role="status">
               <Info size={18}/><span>A comparação é parcial.

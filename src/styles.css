@@ -344,3 +344,16 @@ html.native-vibrancy .glass-inset{
 .quarantine-item small{font-size:11px;color:#9caec1}
 .quarantine-item .outline-button{flex-shrink:0;display:inline-flex;align-items:center;gap:6px}
 @media(max-width:630px){.quarantine-item{align-items:stretch;flex-direction:column}.quarantine-item .outline-button{justify-content:center}}
+
+/* Explicit BLAKE3 I/O budget and measured post-scan diagnostics. */
+.hash-budget-option{display:flex;gap:7px;align-items:center;flex-wrap:wrap;
+  color:#a7b8d1;font-weight:600;font-size:11px}
+.hash-budget-option select{color:#d8e8fa;background:rgba(16,36,65,.62);
+  border:1px solid rgba(151,184,233,.3);border-radius:8px;
+  padding:9px 11px;max-width:100%;font:inherit;cursor:pointer}
+.hash-budget-option select:disabled{opacity:.48;cursor:not-allowed}
+.hash-benchmark{display:flex;align-items:flex-start;gap:10px;margin:10px 0 15px;
+  padding:12px 14px;border-radius:10px;color:#a6c8dc;
+  font-size:11px;line-height:1.65}
+.hash-benchmark strong{color:#dceafc}
+.hash-benchmark svg{flex-shrink:0;margin-top:2px;color:#7ac4ed}

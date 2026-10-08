@@ -40,6 +40,11 @@ export interface ScanReport {
   hardlinkAliases: number;
   skippedContentFiles: number;
   hashBytesRead: number;
+  fingerprintBytesRead: number;
+  fullHashBytesRead: number;
+  fingerprintElapsedMs: number;
+  fullHashElapsedMs: number;
+  hashReadBudgetBytes: number | null;
   topFiles: FileResult[];
   topDirectories: DirectoryResult[];
   fileTypes: FileType[];
@@ -56,6 +61,8 @@ export interface ScanRequest {
   /** Omit to scan every accessible file; set only for explicit sampling. */
   maxFiles?: number;
   analyzeDuplicates?: boolean;
+  /** Explicit read budget, capped by default to 8 GiB. */
+  hashBudget?: 'standard' | 'deep' | 'unlimited';
 }
 
 export interface SearchRequest {
@@ -154,6 +161,7 @@ export interface CompareReport {
   matches: CompareMatch[];
   potentialLogicalSavingsBytes: number;
   hashBytesRead: number;
+  hashStageElapsedMs: number;
   skippedCloudFiles: number;
   hardlinkAliases: number;
   errors: number;
