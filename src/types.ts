@@ -121,6 +121,8 @@ export interface AllocationItem {
   path: string;
   logicalBytes: number;
   allocatedBytes: number | null;
+  /** Volume-wide NTFS hardlink count; not confined to selected root. */
+  hardlinkCount: number | null;
   status: 'measured' | 'excluded' | 'changed' | 'outside' | 'unavailable' | 'unsupported';
 }
 export interface AllocationReport {
