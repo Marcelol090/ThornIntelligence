@@ -36,6 +36,7 @@ export interface ScanReport {
   errorSamples: string[];
   truncated: boolean;
   duplicateAnalysisComplete: boolean;
+  hashingSkipped: boolean;
   hardlinkAliases: number;
   skippedContentFiles: number;
   hashBytesRead: number;
@@ -53,6 +54,7 @@ export interface ScanRequest {
   regex: string | null;
   minSizeBytes: number;
   maxFiles: number;
+  analyzeDuplicates?: boolean;
 }
 
 export interface SearchRequest {

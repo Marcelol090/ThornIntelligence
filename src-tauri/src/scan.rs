@@ -42,6 +42,9 @@ pub struct ScanRequest {
     pub regex: Option<String>,
     pub min_size_bytes: Option<u64>,
     pub max_files: Option<usize>,
+    /// Defaults to true for older callers. Frontend now defaults to quick metadata scan.
+    #[serde(default)]
+    pub analyze_duplicates: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +96,7 @@ pub struct ScanReport {
     pub error_samples: Vec<String>,
     pub truncated: bool,
     pub duplicate_analysis_complete: bool,
+    pub hashing_skipped: bool,
     pub hardlink_aliases: usize,
     /// Candidates skipped to avoid opening cloud/offline/reparse content.
     pub skipped_content_files: usize,
@@ -326,6 +330,7 @@ pub fn scan_with_control(
     mut progress: impl FnMut(ScanProgress),
 ) -> Result<ScanReport, String> {
     let timer = Instant::now();
+    let hashing_skipped = !request.analyze_duplicates.unwrap_or(true);
     let mut last_update = Instant::now();
     progress(ScanProgress { phase: "scanning".into(), files_scanned: 0, hash_bytes_read: 0 });
     let requested_root = Path::new(&request.root);
@@ -467,6 +472,33 @@ pub fn scan_with_control(
     }).collect();
     file_types.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     file_types.truncate(30);
+
+    // Fast inventory mode intentionally skips all content I/O. This is not a
+    // duplicate report; do not imply a zero duplicates result or savings.
+    if hashing_skipped {
+        check_cancel(cancel)?;
+        progress(ScanProgress {
+            phase: "complete".into(),
+            files_scanned: records.len(),
+            hash_bytes_read: 0,
+        });
+        return Ok(ScanReport {
+            root: root.display().to_string(),
+            files_scanned: records.len(),
+            directories_scanned,
+            logical_bytes,
+            elapsed_ms: timer.elapsed().as_millis(),
+            errors, error_samples, truncated,
+            duplicate_analysis_complete: false,
+            hashing_skipped: true,
+            hardlink_aliases: 0,
+            skipped_content_files: skipped_reparse_directories,
+            hash_bytes_read: 0,
+            top_files, top_directories, file_types,
+            duplicates: Vec::new(), matches,
+            total_matches, potential_savings_bytes: 0,
+        });
+    }
 
     let mut size_buckets = HashMap::<u64, Vec<&FileRecord>>::new();
     for record in &records {
@@ -686,6 +718,7 @@ pub fn scan_with_control(
         error_samples,
         truncated,
         duplicate_analysis_complete,
+        hashing_skipped: false,
         hardlink_aliases,
         skipped_content_files,
         hash_bytes_read: hashed_bytes,
@@ -711,7 +744,7 @@ mod tests {
         let token = AtomicBool::new(true);
         let report = scan_with_control(ScanRequest {
             root: dir.path().display().to_string(),
-            regex: None, min_size_bytes: None, max_files: None,
+            regex: None, min_size_bytes: None, max_files: None, analyze_duplicates: None,
         }, &token, |_| {});
         assert!(report.unwrap_err().contains("cancelada"));
     }
@@ -724,7 +757,7 @@ mod tests {
         let token = AtomicBool::new(false);
         let result = scan_with_control(ScanRequest {
             root: dir.path().display().to_string(),
-            regex: None, min_size_bytes: None, max_files: None,
+            regex: None, min_size_bytes: None, max_files: None, analyze_duplicates: None,
         }, &token, |p| {
             if p.phase == "hashing" {
                 token.store(true, Ordering::Relaxed);
@@ -741,11 +774,31 @@ mod tests {
         let mut events = Vec::new();
         let report = scan_with_control(ScanRequest {
             root: dir.path().display().to_string(),
-            regex: None, min_size_bytes: None, max_files: None,
+            regex: None, min_size_bytes: None, max_files: None, analyze_duplicates: None,
         }, &AtomicBool::new(false), |p| events.push(p));
         assert_eq!(report.unwrap().files_scanned, 2);
         assert!(events.iter().any(|p| p.phase == "hashing"));
         assert_eq!(events.last().unwrap().phase, "complete");
+    }
+
+    #[test]
+    fn metadata_only_mode_skips_content_hash_and_marks_duplicate_metrics_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("copy_1.bin"), vec![11u8; 2_000_000]).unwrap();
+        fs::write(dir.path().join("copy_2.bin"), vec![11u8; 2_000_000]).unwrap();
+        let mut phases = Vec::new();
+        let report = scan_with_control(ScanRequest {
+            root: dir.path().display().to_string(),
+            regex: None, min_size_bytes: None, max_files: None,
+            analyze_duplicates: Some(false),
+        }, &AtomicBool::new(false), |p| phases.push(p.phase)).unwrap();
+        assert_eq!(report.files_scanned, 2);
+        assert!(report.hashing_skipped);
+        assert!(!report.duplicate_analysis_complete);
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.hash_bytes_read, 0);
+        assert_eq!(report.top_files.len(), 2);
+        assert!(!phases.iter().any(|phase| phase == "hashing" || phase == "fingerprinting"));
     }
 
     #[test]
@@ -757,7 +810,7 @@ mod tests {
         let mut phases = Vec::new();
         let report = scan_with_control(ScanRequest {
             root: dir.path().display().to_string(), regex: None,
-            min_size_bytes: None, max_files: None,
+            min_size_bytes: None, max_files: None, analyze_duplicates: None,
         }, &AtomicBool::new(false), |p| phases.push(p.phase)).unwrap();
         assert!(report.duplicates.is_empty());
         assert_eq!(report.hash_bytes_read, 2 * PREFIX_BYTES as u64);
@@ -776,7 +829,7 @@ mod tests {
         fs::write(dir.path().join("two"), second).unwrap();
         let report = scan(ScanRequest {
             root: dir.path().display().to_string(), regex: None,
-            min_size_bytes: None, max_files: None,
+            min_size_bytes: None, max_files: None, analyze_duplicates: None,
         }).unwrap();
         assert!(report.duplicates.is_empty());
         assert_eq!(report.hash_bytes_read, 2 * PREFIX_BYTES as u64
@@ -795,7 +848,7 @@ mod tests {
             root: dir.path().display().to_string(),
             regex: Some(".*\\.txt$".into()),
             min_size_bytes: Some(1),
-            max_files: None,
+            max_files: None, analyze_duplicates: None,
         }).unwrap();
         assert_eq!(report.files_scanned, 3);
         assert_eq!(report.total_matches, 2);
@@ -817,7 +870,7 @@ mod tests {
             root: dir.path().display().to_string(),
             regex: None,
             min_size_bytes: None,
-            max_files: None,
+            max_files: None, analyze_duplicates: None,
         }).unwrap();
 
         assert_eq!(report.files_scanned, 2);
@@ -839,7 +892,7 @@ mod tests {
             root: dir.path().display().to_string(),
             regex: None,
             min_size_bytes: None,
-            max_files: None,
+            max_files: None, analyze_duplicates: None,
         }).unwrap();
 
         assert_eq!(report.hardlink_aliases, 1);
@@ -857,7 +910,7 @@ mod tests {
             root: dir.path().display().to_string(),
             regex: None,
             min_size_bytes: None,
-            max_files: None,
+            max_files: None, analyze_duplicates: None,
         }).unwrap();
         assert_eq!(report.files_scanned, 2);
         assert!(report.duplicates.is_empty());
@@ -913,7 +966,7 @@ mod tests {
         }
         let report = scan(ScanRequest {
             root: dir.path().display().to_string(),
-            regex: None, min_size_bytes: None, max_files: None,
+            regex: None, min_size_bytes: None, max_files: None, analyze_duplicates: None,
         }).unwrap();
         assert_eq!(report.top_files.len(), MAX_RESULTS);
         assert_eq!(report.top_files[0].size_bytes, 330);
@@ -927,7 +980,7 @@ mod tests {
         fs::write(dir.path().join("2"), "two").unwrap();
         let report = scan(ScanRequest {
             root: dir.path().display().to_string(),
-            regex: None, min_size_bytes: None, max_files: Some(1),
+            regex: None, min_size_bytes: None, max_files: Some(1), analyze_duplicates: None,
         }).unwrap();
         assert!(report.truncated);
         assert_eq!(report.files_scanned, 1);

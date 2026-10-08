@@ -121,3 +121,11 @@ npm run tauri dev
 Testar: Windows 10 (Acrylic) e Windows 11 (Mica), efeitos de transparência ativados/desativados, redimensionamento e contraste; HDD e NVMe com centenas de milhares de arquivos de diferentes tamanhos; OneDrive Files On-Demand; amostras iguais com finais diferentes; hardlinks; cancelamento e orçamento de leitura. Executar benchmarks **antes/depois** em pasta de teste descartável; não anunciar ganhos numéricos sem medição.
 
 Fontes Exa: [Tauri setEffects](https://v2.tauri.app/reference/javascript/api/namespacewindow/), [Tauri window-vibrancy](https://github.com/tauri-apps/window-vibrancy), [Microsoft File Attribute Constants](https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants), [DiskSleuth staged hashing](https://github.com/Swatto86/DiskSleuth).
+
+## Modo rápido (sem BLAKE3) — funcionalidade opt-in
+
+Agora a tela principal começa com **Incluir BLAKE3 desativado**, acelerando o inventário de arquivos grandes, tipos e diretórios sem ler o conteúdo de nenhum arquivo. O relatório marca `hashingSkipped=true`, e a UI mostra **não avaliado** em vez de 0 duplicados/0 bytes de economia (0 seria enganoso).
+
+Ao ativar a opção ou clicar **Executar BLAKE3** na aba de Duplicados, o scanner aplica amostragem de 16 KiB, BLAKE3 completo nos candidatos coincidentes e validação de hardlinks. A configuração é por execução; nenhuma exclusão é feita.
+
+A mudança mantém compatibilidade de API: callers antigos sem `analyzeDuplicates` usam análise completa. O novo frontend solicita explicitamente `analyzeDuplicates: false` por padrão. O teste `metadata_only_mode_skips_content_hash_and_marks_duplicate_metrics_unknown` valida a ausência de leituras de hash e a distinção entre resultados não medidos e zero.
