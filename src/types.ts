@@ -182,6 +182,8 @@ export interface IndexStats {
   completedAtUnix: number;
   elapsedMs: number;
   batchesWritten: number;
+  /** SQL comparison time only; zero for USN shortcuts. */
+  comparisonMs: number;
   /** Native MFT used only after guards; USN no-change or WalkDir fallback. */
   indexMethod: 'ntfs_mft' | 'usn_unchanged' | 'usn_delta' | 'walkdir';
 }

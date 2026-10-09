@@ -490,11 +490,16 @@ export default function App() {
         stats.indexMethod === 'usn_delta' ? 'USN incremental — metadados existentes' :
         'WalkDir (fallback seguro)';
       setToast('Índice: ' + mode + ' · ' + number(stats.added) + ' novos, ' +
-        number(stats.changed) + ' alterados, ' + number(stats.unchanged) + ' inalterados.');
+        number(stats.changed) + ' alterados, ' + number(stats.unchanged) + ' inalterados' +
+        (stats.indexMethod === 'walkdir' || stats.indexMethod === 'ntfs_mft'
+          ? ' · comparação SQLite: ' + number(stats.comparisonMs) + ' ms.' : '.'));
     } catch (err) {
       const message = String(err);
       if (message.includes('cancelada')) setToast('Indexação cancelada; último snapshot preservado.');
-      else setError(message);
+      else if (message.includes('outro processo')) {
+        setError('Outra instância atualizou este índice durante a análise. O snapshot mais recente foi preservado; execute Atualizar índice novamente.');
+        await loadIndexedScopes();
+      } else setError(message);
     } finally {
       if (activeJob.current === jobId) activeJob.current = null;
       setScanProgress(null);

@@ -22,6 +22,8 @@ pub struct IndexStats {
     pub completed_at_unix: i64,
     pub elapsed_ms: u128,
     pub batches_written: usize,
+    /// SQL classification stage only; not a disk benchmark.
+    pub comparison_ms: u128,
     /// Actual strategy, not an unverified speed claim.
     pub index_method: String,
 }
@@ -413,7 +415,7 @@ fn cached_ntfs_delta(db_path: &Path,root:&Path)->Option<IndexStats> {
         added:0,changed,unchanged:(count as usize).saturating_sub(changed),
         removed:0,skipped_directories:0,completed_at_unix:done,
         elapsed_ms:started.elapsed().as_millis(),batches_written:1,
-        index_method:"usn_delta".into(),
+        comparison_ms:0,index_method:"usn_delta".into(),
     })
 }
 
@@ -501,7 +503,8 @@ fn refresh_inner(
                 root:root_str,files:file_count,added:0,changed:0,
                 unchanged:file_count,removed:0,skipped_directories:0,
                 completed_at_unix:completed,elapsed_ms:timer.elapsed().as_millis(),
-                batches_written:0,index_method:"usn_unchanged".into(),
+                batches_written:0,comparison_ms:0,
+                index_method:"usn_unchanged".into(),
             });
         }
     }
@@ -516,6 +519,19 @@ fn refresh_inner(
         }
     }
     let mut conn = connection(db_path)?;
+    // Private per connection, including across Thorn processes. The TEMP
+    // table shadows the legacy main table without modifying legacy data.
+    conn.execute_batch(
+        "CREATE TEMP TABLE indexed_stage (
+           root TEXT NOT NULL,
+           path TEXT NOT NULL,
+           parent_path TEXT NOT NULL,
+           size_bytes INTEGER NOT NULL,
+           modified_ns INTEGER NOT NULL,
+           attributes INTEGER NOT NULL,
+           PRIMARY KEY(root,path)
+         );"
+    ).map_err(db_err)?;
 
     // The previous snapshot is never modified until final publication.
     // Do not touch staging before testing the USN shortcut. That DELETE
@@ -563,9 +579,6 @@ fn refresh_inner(
     let mut folder_totals = HashMap::<PathBuf,(u64,u64)>::new();
     folder_totals.insert(root.clone(), (0,0));
     let mut files = 0usize;
-    let mut added = 0usize;
-    let mut changed = 0usize;
-    let mut unchanged = 0usize;
     let mut skipped_directories = 0usize;
     let mut batches_written = 0usize;
     let mut last_event = Instant::now();
@@ -631,16 +644,7 @@ fn refresh_inner(
         }
         let modified = mtime_ns(&metadata);
         let flags = i64::from(attributes(&metadata));
-        let prior: Option<(i64, i64, i64)> = conn.query_row(
-            "SELECT size_bytes,modified_ns,attributes FROM indexed_files WHERE root=?1 AND path=?2",
-            params![root_str, path],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional().map_err(db_err)?;
-        match prior {
-            None => added += 1,
-            Some(old) if old == (size, modified, flags) => unchanged += 1,
-            Some(_) => changed += 1,
-        }
+        // Classify in one SQL join after all metadata batches have staged.
         batch.push(StagedFile { path, parent_path, size, modified, flags });
         files += 1;
         if batch.len() == INDEX_BATCH_SIZE {
@@ -690,7 +694,37 @@ fn refresh_inner(
     // files this final merge can produce substantial WAL I/O; it does not hold
     // a write transaction during the preceding, potentially hours-long walk.
     wait_indexer(paused, cancel, files, progress)?;
-    let tx = conn.transaction().map_err(db_err)?;
+    // Lock before reading the generation; stale concurrent writers abort.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(db_err)?;
+    let current: (i64,i64) = tx.query_row(
+        "SELECT generation,revision FROM indexed_scopes WHERE root=?1",
+        params![root_str], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional().map_err(db_err)?.unwrap_or((0,0));
+    if current != (old_generation,old_revision) {
+        return Err("Índice alterado por outro processo; reinicie a indexação para evitar sobrescrever um snapshot mais recente.".into());
+    }
+    let compare_started = Instant::now();
+    let (new_count, changed_count, same_count): (i64,i64,i64) = tx.query_row(
+        "SELECT COUNT(*) - COUNT(f.path),
+                COALESCE(SUM(CASE WHEN f.path IS NOT NULL AND
+                    (f.size_bytes<>s.size_bytes OR f.modified_ns<>s.modified_ns OR f.attributes<>s.attributes)
+                    THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN f.path IS NOT NULL AND
+                    f.size_bytes=s.size_bytes AND f.modified_ns=s.modified_ns AND f.attributes=s.attributes
+                    THEN 1 ELSE 0 END),0)
+         FROM indexed_stage AS s
+         LEFT JOIN indexed_files AS f ON f.root=s.root AND f.path=s.path
+         WHERE s.root=?1",
+        params![root_str], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).map_err(db_err)?;
+    let comparison_ms = compare_started.elapsed().as_millis();
+    let added = usize::try_from(new_count).map_err(db_err)?;
+    let changed = usize::try_from(changed_count).map_err(db_err)?;
+    let unchanged = usize::try_from(same_count).map_err(db_err)?;
+    if added.saturating_add(changed).saturating_add(unchanged) != files {
+        return Err("Falha na consistência da classificação SQLite; snapshot não publicado.".into());
+    }
     tx.execute(
         "INSERT INTO indexed_files(root,path,parent_path,size_bytes,modified_ns,attributes,generation)
          SELECT root,path,parent_path,size_bytes,modified_ns,attributes,?2
@@ -772,7 +806,7 @@ fn refresh_inner(
     Ok(IndexStats {
         root: root_str, files, added, changed, unchanged, removed,
         skipped_directories, completed_at_unix, elapsed_ms: timer.elapsed().as_millis(),
-        batches_written,
+        batches_written, comparison_ms,
         index_method: if used_native {"ntfs_mft"} else {"walkdir"}.into(),
     })
 }
@@ -792,7 +826,9 @@ pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSea
             .map_err(|e| format!("Regex inválida: {e}"))?),
         None => None,
     };
-    let conn = connection(db_path)?;
+    let mut conn = connection(db_path)?;
+    // Read generation and file rows from the same WAL snapshot.
+    let tx = conn.transaction().map_err(db_err)?;
     let (generation, completed_at_unix): (i64, i64) = conn.query_row(
         "SELECT generation,completed_at_unix FROM indexed_scopes WHERE root=?1",
         params![root], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -800,7 +836,7 @@ pub fn search_index(db_path: &Path, request: SearchRequest) -> Result<IndexedSea
         .ok_or("Esta pasta ainda não possui snapshot completo. Use Atualizar índice.")?;
     let min_size = i64::try_from(request.min_size_bytes.unwrap_or(0))
         .map_err(|_| "Tamanho mínimo fora do intervalo.")?;
-    let mut stmt = conn.prepare(
+    let mut stmt = tx.prepare(
         "SELECT path,size_bytes,attributes FROM indexed_files
          WHERE root=?1 AND generation=?2 AND size_bytes>=?3"
     ).map_err(db_err)?;
@@ -1240,6 +1276,63 @@ mod tests {
         assert!(browse_tree(&db,tree_req(&root,&root,100,None,Some(page.generation))).is_err());
         let updated=browse_tree(&db,tree_req(&root,&root,100,None,None)).unwrap();
         assert_eq!(updated.nodes.len(),2);
+    }
+
+    #[test]
+    fn bulk_classification_counts_new_changed_and_unchanged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("keep"), b"same").unwrap();
+        fs::write(root.join("change"), b"old").unwrap();
+        let db = dir.path().join("index.sqlite");
+        let first = refresh_inner(&db,root.to_str().unwrap(),None,
+            &AtomicBool::new(false),&AtomicBool::new(false),&mut |_| {},false).unwrap();
+        assert_eq!((first.added,first.changed,first.unchanged),(2,0,0));
+        fs::write(root.join("change"), b"changed contents").unwrap();
+        fs::write(root.join("new"), b"new").unwrap();
+        let next = refresh_inner(&db,root.to_str().unwrap(),None,
+            &AtomicBool::new(false),&AtomicBool::new(false),&mut |_| {},false).unwrap();
+        assert_eq!((next.added,next.changed,next.unchanged,next.removed),(1,1,1,0));
+        let conn=connection(&db).unwrap();
+        let published:i64=conn.query_row(
+            "SELECT COUNT(*) FROM indexed_files WHERE root=?1",
+            params![root.display().to_string()],|r|r.get(0),
+        ).unwrap();
+        assert_eq!(published,3);
+    }
+
+    #[test]
+    fn competing_indexer_does_not_overwrite_newer_generation() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=dir.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        for i in 0..1030 {
+            fs::write(root.join(format!("item-{i:04}")),b"payload").unwrap();
+        }
+        let db=dir.path().join("index.sqlite");
+        let mut injected=false;
+        let result=refresh_inner(&db,root.to_str().unwrap(),None,
+            &AtomicBool::new(false),&AtomicBool::new(false),&mut |event| {
+                if !injected && event.phase=="indexing"
+                    && event.files_scanned==INDEX_BATCH_SIZE {
+                    injected=true;
+                    let other=refresh_inner(&db,root.to_str().unwrap(),None,
+                        &AtomicBool::new(false),&AtomicBool::new(false),&mut |_| {},false).unwrap();
+                    assert_eq!(other.files,1030);
+                }
+            },false);
+        assert!(injected);
+        assert!(result.unwrap_err().contains("outro processo"));
+        let scopes=list_scopes(&db).unwrap();
+        assert_eq!(scopes.len(),1);
+        assert_eq!(scopes[0].files,1030);
+        let conn=connection(&db).unwrap();
+        let generation:i64=conn.query_row(
+            "SELECT generation FROM indexed_scopes WHERE root=?1",
+            params![root.display().to_string()],|r|r.get(0),
+        ).unwrap();
+        assert_eq!(generation,1);
     }
 
     #[test]
