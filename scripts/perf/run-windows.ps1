@@ -4,6 +4,7 @@
 param(
     [ValidateRange(100, 120000)][int]$Files = 1500,
     [ValidateRange(2, 30)][int]$Repeats = 5,
+    [ValidateRange(1, 16)][int]$BuildJobs = 2,
     [string]$OutputDirectory = 'reports/performance'
 )
 Set-StrictMode -Version Latest
@@ -26,7 +27,7 @@ $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty
 $os = (Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)
 $env:THORN_PERF_FILES = [string]$Files
 $env:THORN_PERF_REPEAT = [string]$Repeats
-$arguments = @('test', '--release', '--manifest-path', 'src-tauri/Cargo.toml',
+$arguments = @('test', '--release', '--jobs', [string]$BuildJobs, '--manifest-path', 'src-tauri/Cargo.toml',
                'perf_kit_', '--', '--ignored', '--nocapture', '--test-threads=1')
 Write-Host "Running $Files synthetic files x $Repeats benchmark repetitions" -ForegroundColor Cyan
 Write-Host 'Compilation and fixture generation are excluded from Rust scenario timings.'
@@ -84,6 +85,7 @@ $data = [ordered]@{
         profile = 'release'
         files = $Files
         repetitions = $Repeats
+        build_jobs = $BuildJobs
     }
     metrics = @($metrics.ToArray())
     storage = @($storage.ToArray())
