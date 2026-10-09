@@ -796,3 +796,30 @@ html.native-vibrancy .glass-studio.clarity-mode .onboarding.glass {background:#4
   .appearance-panel * {color:inherit;}
   .appearance-trigger,.appearance-reset {border-color:ButtonText;}
 }
+
+
+/* Compositor budget: never backdrop-blur the entire desktop application.
+   The native DWM material stays independent of CSS filter processing.
+   Individual panels retain restrained local frost. */
+.glass-studio,
+html.native-vibrancy .glass-studio {
+  backdrop-filter:none;
+  -webkit-backdrop-filter:none;
+}
+.glass-studio .glass,
+html.native-vibrancy .glass-studio .glass {
+  backdrop-filter:blur(12px) saturate(112%);
+  -webkit-backdrop-filter:blur(12px) saturate(112%);
+}
+.glass-studio .sidebar.glass,
+html.native-vibrancy .glass-studio .sidebar.glass {
+  backdrop-filter:blur(14px);
+  -webkit-backdrop-filter:blur(14px);
+}
+.glass-studio.clarity-mode .glass,
+html.native-vibrancy .glass-studio.clarity-mode .glass,
+.glass-studio.clarity-mode .sidebar.glass,
+html.native-vibrancy .glass-studio.clarity-mode .sidebar.glass {
+  backdrop-filter:none;
+  -webkit-backdrop-filter:none;
+}
