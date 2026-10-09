@@ -2,7 +2,7 @@
 # Run in PowerShell 7 on Windows from any working directory.
 [CmdletBinding()]
 param(
-    [ValidateRange(100, 120000)][int]$Files = 1500,
+    [ValidateRange(100, 350000)][int]$Files = 1500,
     [ValidateRange(2, 30)][int]$Repeats = 5,
     [ValidateRange(1, 16)][int]$BuildJobs = 2,
     [string]$OutputDirectory = 'reports/performance'
