@@ -502,3 +502,297 @@ html.native-vibrancy .glass-studio.clarity-mode .sidebar.glass { background:#211
   .glass-studio .rail-toggle,.glass-studio .clarity-toggle,
   .glass-studio .primary-button {border:1px solid ButtonText;}
 }
+
+
+/* -------------------------------------------------------------
+   WORKSPACE FIX 2026-10-08
+   Native window owns window geometry. WebView must NOT create a
+   second inset "window", root scrolling, or another title border.
+   ------------------------------------------------------------- */
+html,body,#root {
+  width:100%;height:100%;min-height:0;max-height:100%;
+  overflow:hidden;overscroll-behavior:none;
+}
+#root { height:100dvh; }
+body { margin:0; }
+.glass-studio,
+html.native-vibrancy .glass-studio {
+  box-sizing:border-box;
+  display:grid;
+  grid-template-columns:var(--rail-width) minmax(0,1fr);
+  width:100%;max-width:none;
+  height:100%;min-height:0;
+  margin:0;
+  border:0;border-radius:0;
+  overflow:hidden;
+  box-shadow:none;
+  isolation:isolate;
+}
+.glass-studio[data-frame="framed"],
+html.native-vibrancy .glass-studio[data-frame="framed"] {
+  width:calc(100% - 16px);height:calc(100% - 16px);
+  margin:8px;
+  border:1px solid rgba(244,231,249,.18);
+  border-radius:16px;
+  box-shadow:0 4px 20px rgba(10,8,15,.24);
+}
+.glass-studio .main-shell {
+  display:flex;flex-direction:column;
+  height:100%;min-height:0;min-width:0;
+  overflow:hidden;
+  border-radius:0;
+}
+.glass-studio .sidebar,
+.glass-studio .sidebar.glass {
+  position:relative;top:auto;
+  height:100%;min-height:0;max-height:none;
+  min-width:0;overflow-y:auto;overflow-x:hidden;
+  border-radius:0;
+  overscroll-behavior:contain;
+  scrollbar-width:none;
+}
+.glass-studio .sidebar::-webkit-scrollbar {width:0;}
+.glass-studio .sidebar-spacer {min-height:12px;}
+.glass-studio .topbar {
+  position:relative;z-index:25;flex:0 0 70px;
+  height:70px;min-height:70px;
+  overflow:visible;min-width:0;
+}
+.glass-studio .top-actions {min-width:0;gap:10px;}
+.glass-studio .content {
+  position:relative;
+  flex:1 1 auto;min-height:0;min-width:0;
+  width:100%;max-width:none;
+  margin:0;padding:27px clamp(22px,2.65vw,43px) 35px;
+  overflow-y:auto;overflow-x:hidden;
+  overscroll-behavior-y:contain;
+  scroll-behavior:auto;
+  scrollbar-gutter:stable;
+  scrollbar-width:thin;
+  scrollbar-color:rgba(195,174,207,.45) transparent;
+}
+.glass-studio .content::-webkit-scrollbar {width:9px;}
+.glass-studio .content::-webkit-scrollbar-track {background:transparent;}
+.glass-studio .content::-webkit-scrollbar-thumb {
+  border-radius:999px;background:rgba(195,174,207,.42);
+  border:2px solid transparent;background-clip:padding-box;
+}
+.glass-studio .content::-webkit-scrollbar-thumb:hover {background:rgba(208,191,219,.68);}
+.glass-studio .indexed-tree-window {overscroll-behavior:contain;scrollbar-width:thin;}
+.glass-studio .bottom-status {margin-top:27px;padding-bottom:7px;}
+.glass-studio .hero-heading {align-items:flex-start;}
+.glass-studio .hero-heading > * {min-width:0;}
+.glass-studio .scope-strip,.glass-studio .panel,.glass-studio .metric {min-width:0;}
+.glass-studio .scope-full {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+
+/* Optional shell frame never changes the viewport scroll ownership. */
+.glass-studio[data-frame="framed"] .main-shell {border-radius:0 15px 15px 0;}
+.glass-studio[data-frame="framed"] .sidebar {border-radius:15px 0 0 15px;}
+.glass-studio[data-frame="edge"] .main-shell,
+.glass-studio[data-frame="edge"] .sidebar {border-radius:0;}
+
+/* Real personalisation: selector state persists in localStorage. */
+.glass-studio {
+  --studio-accent:#c8b5fb;
+  --studio-accent-rgb:200 181 251;
+  --studio-button-from:#f0d7da;
+  --studio-button-to:#d0b9df;
+  --studio-panel-alpha:.50;
+}
+.glass-studio[data-accent="mint"] {
+  --studio-accent:#91e1cb;
+  --studio-accent-rgb:145 225 203;
+  --studio-button-from:#d5f4e8;
+  --studio-button-to:#9dddc8;
+}
+.glass-studio[data-accent="coral"] {
+  --studio-accent:#f4b29b;
+  --studio-accent-rgb:244 178 155;
+  --studio-button-from:#ffe1ce;
+  --studio-button-to:#f5b6ae;
+}
+.glass-studio[data-accent="blue"] {
+  --studio-accent:#9cc8ff;
+  --studio-accent-rgb:156 200 255;
+  --studio-button-from:#dceaff;
+  --studio-button-to:#abc9f8;
+}
+.glass-studio .nav-link.selected {
+  color:#fff;
+  border-color:rgb(var(--studio-accent-rgb) / .36);
+  background:linear-gradient(135deg,
+    rgb(var(--studio-accent-rgb) / .23),
+    rgb(var(--studio-accent-rgb) / .09));
+}
+.glass-studio .nav-link.selected svg,
+.glass-studio .nav-indicator,
+.glass-studio .heading-period,
+.glass-studio .eyebrow,
+.glass-studio .rail-toggle:hover,
+.glass-studio .text-button {color:var(--studio-accent);}
+.glass-studio .nav-indicator {background:var(--studio-accent);}
+.glass-studio .brand-symbol {
+  background:linear-gradient(140deg,
+    rgb(var(--studio-accent-rgb) / .35),
+    rgb(var(--studio-accent-rgb) / .12));
+}
+.glass-studio .primary-button {
+  background:linear-gradient(115deg,var(--studio-button-from),var(--studio-button-to));
+}
+.glass-studio .primary-button:hover:not(:disabled) {
+  background:linear-gradient(115deg,var(--studio-button-from),var(--studio-button-to));
+  filter:brightness(1.055);
+}
+.glass-studio .glass,
+html.native-vibrancy .glass-studio .glass {
+  background:rgba(62,53,65,var(--studio-panel-alpha));
+  border-color:rgba(255,255,255,.13);
+}
+.glass-studio .sidebar.glass,
+html.native-vibrancy .glass-studio .sidebar.glass {
+  background:linear-gradient(165deg,
+    rgba(37,33,42,var(--studio-panel-alpha)),
+    rgba(24,23,30,var(--studio-panel-alpha)));
+  border-right:1px solid rgba(255,255,255,.12);
+}
+.glass-studio .onboarding.glass,
+html.native-vibrancy .glass-studio .onboarding.glass {
+  background:
+    radial-gradient(ellipse 50% 120% at 48% 62%,rgba(200,118,108,.22),transparent 78%),
+    linear-gradient(135deg,
+      rgba(75,63,73,var(--studio-panel-alpha)),
+      rgba(40,37,49,var(--studio-panel-alpha)));
+}
+.glass-studio .studio-feature-visual {
+  background:linear-gradient(140deg,
+    rgba(196,180,194,var(--studio-panel-alpha)),rgba(43,37,52,.18));
+}
+.glass-studio.clarity-mode .glass,
+html.native-vibrancy .glass-studio.clarity-mode .glass,
+.glass-studio.clarity-mode .sidebar.glass,
+html.native-vibrancy .glass-studio.clarity-mode .sidebar.glass {
+  background:#39343f;
+  backdrop-filter:none;-webkit-backdrop-filter:none;
+}
+.glass-studio.clarity-mode .sidebar.glass,
+html.native-vibrancy .glass-studio.clarity-mode .sidebar.glass {background:#211f26;}
+.glass-studio.clarity-mode .onboarding.glass,
+html.native-vibrancy .glass-studio.clarity-mode .onboarding.glass {background:#43343f;}
+
+/* A keyboard-operable native details popup, kept OUT of the scrollport. */
+.appearance-menu {position:relative;z-index:40;flex-shrink:0;}
+.appearance-trigger {
+  display:inline-flex;align-items:center;gap:8px;
+  min-height:34px;padding:7px 11px;
+  cursor:pointer;user-select:none;white-space:nowrap;
+  list-style:none;
+  border:1px solid rgba(238,225,244,.20);
+  border-radius:10px;background:rgba(255,255,255,.075);
+  color:#f0e4f2;font:inherit;font-size:11px;font-weight:650;
+}
+.appearance-trigger::-webkit-details-marker {display:none;}
+.appearance-trigger::marker {content:"";}
+.appearance-trigger:hover,
+.appearance-menu[open] .appearance-trigger {
+  border-color:rgb(var(--studio-accent-rgb) / .48);
+  background:rgb(var(--studio-accent-rgb) / .15);
+}
+.appearance-panel {
+  position:absolute;right:0;top:calc(100% + 10px);
+  width:315px;max-width:calc(100vw - 28px);
+  max-height:min(70dvh,560px);overflow-y:auto;overscroll-behavior:contain;
+  display:grid;gap:13px;
+  padding:18px;border:1px solid rgba(255,255,255,.24);
+  border-radius:16px;
+  background:rgba(43,39,49,.97);
+  box-shadow:0 24px 60px rgba(0,0,0,.47),inset 0 1px rgba(255,255,255,.12);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  color:#f6ebf5;
+  scrollbar-width:thin;
+}
+.appearance-panel-heading {display:grid;gap:4px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,.12);}
+.appearance-panel-heading strong {font-size:14px;}
+.appearance-panel-heading small,.appearance-field small {font-size:10px;color:#c5b9c9;line-height:1.5;}
+.appearance-field {display:grid;gap:7px;min-width:0;font-size:11px;font-weight:630;color:#e4d9e8;}
+.appearance-field select {
+  width:100%;min-height:36px;padding:8px 10px;
+  border:1px solid rgba(255,255,255,.2);border-radius:9px;
+  color:#f5eaf5;background:#24212c;font:inherit;
+}
+.appearance-slider-label {display:flex;justify-content:space-between;align-items:center;}
+.appearance-slider-label output {color:var(--studio-accent);font-variant-numeric:tabular-nums;}
+.appearance-field input[type="range"] {width:100%;margin:0;accent-color:var(--studio-accent);}
+.appearance-check {display:flex;gap:9px;align-items:flex-start;font-size:11px;color:#e5d9e5;cursor:pointer;}
+.appearance-check input {margin:0;accent-color:var(--studio-accent);width:16px;height:16px;}
+.appearance-reset {
+  min-height:36px;padding:8px 12px;cursor:pointer;
+  border:1px solid rgba(255,255,255,.22);border-radius:9px;
+  background:rgba(255,255,255,.085);color:#f4e9f4;font:inherit;font-size:11px;
+}
+.appearance-reset:hover {background:rgba(255,255,255,.15);}
+.appearance-menu :focus-visible {outline:2px solid var(--studio-accent);outline-offset:3px;}
+
+/* Density changes geometry, without CSS scaling that breaks pixels or hitboxes. */
+.glass-studio[data-density="compact"] .content {padding-top:16px;padding-bottom:20px;}
+.glass-studio[data-density="compact"] .hero-heading {margin-bottom:15px;}
+.glass-studio[data-density="compact"] .hero-heading h1 {font-size:clamp(1.55rem,2.1vw,2.35rem);}
+.glass-studio[data-density="compact"] .scope-strip {padding-top:11px;padding-bottom:11px;margin-bottom:16px;}
+.glass-studio[data-density="compact"] .onboarding {min-height:250px;padding:22px 27px;margin-bottom:15px;}
+.glass-studio[data-density="compact"] .onboarding h2 {font-size:clamp(22px,2.4vw,30px);}
+.glass-studio[data-density="compact"] .onboarding-visual {height:205px;}
+.glass-studio[data-density="compact"] .metric {min-height:140px;padding:14px 16px;}
+.glass-studio[data-density="compact"] .panel {padding:16px;}
+.glass-studio[data-density="compact"] .studio-overview-feature {min-height:215px;padding:20px 26px;}
+.glass-studio[data-density="compact"] .nav-menu {gap:3px;}
+.glass-studio[data-density="compact"] .nav-link {min-height:40px;}
+
+/* Prevent phantom horizontal pages and keep the drawer independent. */
+.sidebar-scrim {display:none;}
+@media(max-width:1250px) {
+  .appearance-trigger span {display:none;}
+  .glass-studio .hero-heading {gap:12px;}
+}
+@media(max-width:780px) {
+  .glass-studio,.glass-studio[data-frame="framed"] {
+    width:100%;height:100%;margin:0;border:0;border-radius:0;
+    display:block;
+  }
+  .glass-studio .main-shell {height:100%;min-height:0;}
+  .glass-studio .topbar {height:66px;min-height:66px;flex-basis:66px;}
+  .glass-studio .content {padding:24px 18px 28px;}
+  .glass-studio .sidebar,
+  .glass-studio.rail-expanded .sidebar,
+  html.native-vibrancy .glass-studio .sidebar {
+    position:fixed;z-index:40;top:0;left:0;
+    width:min(300px,88vw);height:100dvh;max-height:none;
+    border-radius:0 16px 16px 0;
+    transform:translateX(-110%);
+  }
+  .glass-studio .sidebar.sidebar-open,
+  .glass-studio.rail-expanded .sidebar.sidebar-open {
+    transform:translateX(0);
+  }
+  .sidebar-scrim {
+    display:block;position:fixed;inset:0;z-index:35;
+    width:100%;height:100%;border:0;border-radius:0;padding:0;
+    background:rgba(0,0,0,.55);cursor:pointer;
+  }
+  .appearance-panel {right:-6px;max-width:calc(100vw - 20px);}
+  .glass-studio[data-frame="framed"] .main-shell {border-radius:0;}
+}
+@media(max-width:570px) {
+  .glass-studio .content {padding:19px 13px 24px;}
+  .glass-studio .topbar {padding:0 13px;}
+  .glass-studio .top-actions {gap:7px;}
+  .glass-studio .appearance-trigger {padding:7px;min-width:34px;justify-content:center;}
+  .glass-studio .hero-heading {flex-wrap:wrap;}
+  .glass-studio .hero-heading .scan-controls {width:100%;}
+}
+@media(prefers-reduced-motion:reduce) {
+  .glass-studio .content {scroll-behavior:auto;}
+}
+@media(forced-colors:active), (prefers-contrast:more) {
+  .appearance-panel {background:Canvas;color:CanvasText;border-color:CanvasText;backdrop-filter:none;}
+  .appearance-panel * {color:inherit;}
+  .appearance-trigger,.appearance-reset {border-color:ButtonText;}
+}
