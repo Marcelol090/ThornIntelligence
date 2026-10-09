@@ -22,6 +22,8 @@ const OPEN_EXISTING: u32 = 3;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
 const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000;
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
 const ERROR_HANDLE_EOF: u32 = 38;
@@ -362,7 +364,9 @@ pub fn enumerate(root:&Path,cancel:&AtomicBool)->Result<Enumeration,String> {
         if rec.attributes & FILE_ATTRIBUTE_REPARSE_POINT!=0 {continue;}
         let is_dir=rec.attributes & FILE_ATTRIBUTE_DIRECTORY!=0;
         if !is_dir {
-            if rec.attributes & FILE_ATTRIBUTE_OFFLINE !=0 {
+            if rec.attributes &
+                (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN |
+                 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) !=0 {
                 // Refuse MFT shortcut if identity cannot be verified without
                 // potentially hydrating a cloud placeholder. WalkDir remains
                 // metadata-only and knows every directory entry.
