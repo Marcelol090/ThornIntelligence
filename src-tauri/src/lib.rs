@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod perf_kit;
+
 mod allocation;
 mod compare;
 mod health;
