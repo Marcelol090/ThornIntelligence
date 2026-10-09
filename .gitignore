@@ -10,3 +10,6 @@ src-tauri/gen/schemas/
 !.env.example
 .idea/
 .vscode/
+
+# Local performance reports may contain machine names and drive metadata.
+reports/performance/
