@@ -444,6 +444,7 @@ export default function App() {
       setUseCachedIndex(true);
       const mode = stats.indexMethod === 'ntfs_mft' ? 'NTFS/MFT verificada' :
         stats.indexMethod === 'usn_unchanged' ? 'USN sem mudanças — sem reenumeração' :
+        stats.indexMethod === 'usn_delta' ? 'USN incremental — metadados existentes' :
         'WalkDir (fallback seguro)';
       setToast('Índice: ' + mode + ' · ' + number(stats.added) + ' novos, ' +
         number(stats.changed) + ' alterados, ' + number(stats.unchanged) + ' inalterados.');

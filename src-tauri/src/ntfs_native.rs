@@ -46,6 +46,13 @@ struct ReadUsnDataV0 {
     timeout: u64, bytes_to_wait_for: u64, journal_id: u64,
 }
 #[repr(C)]
+struct FileIdDescriptor {
+    size: u32,
+    kind: u32, // FileIdType=0, 64-bit NTFS FRN
+    file_id: i64,
+    padding: u64, // 16-byte C union, total structure size 24
+}
+#[repr(C)]
 #[derive(Default)]
 struct ByHandleFileInformation {
     attributes: u32, creation: [u32;2], access: [u32;2], write: [u32;2],
@@ -73,6 +80,14 @@ extern "system" {
         fs_name: *mut u16, fs_name_size: u32,
     ) -> i32;
     fn GetFileInformationByHandle(handle: *mut c_void, data: *mut ByHandleFileInformation) -> i32;
+    fn OpenFileById(
+        volume: *mut c_void, identifier: *const FileIdDescriptor,
+        access: u32, sharing: u32, security: *const c_void,
+        flags: u32,
+    ) -> *mut c_void;
+    fn GetFinalPathNameByHandleW(
+        handle: *mut c_void, result: *mut u16, capacity: u32, flags: u32,
+    ) -> u32;
 }
 
 fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
@@ -258,6 +273,110 @@ pub fn unchanged_since(root:&Path, old:Cursor) -> Result<bool,String> {
     Ok(true)
 }
 
+pub struct NativeDelta {
+    pub changed_files: Vec<(PathBuf,u64)>,
+    pub watermark: Cursor,
+}
+fn path_by_frn(volume:&Handle,frn:u64)->Result<(PathBuf,ByHandleFileInformation),String> {
+    let descriptor=FileIdDescriptor {
+        size:std::mem::size_of::<FileIdDescriptor>() as u32,
+        kind:0,file_id:frn as i64,padding:0,
+    };
+    let handle=unsafe {OpenFileById(
+        volume.0,&descriptor,0x80,FILE_SHARE_ALL,ptr::null(),
+        FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,
+    )};
+    if handle as isize==-1 {return Err("FRN deletado ou inacessível".into());}
+    let handle=Handle(handle);
+    let mut info=ByHandleFileInformation::default();
+    if unsafe {GetFileInformationByHandle(handle.0,&mut info)}==0 {
+        return Err("Metadados FRN indisponíveis".into());
+    }
+    if info.file_index()!=frn || info.number_of_links!=1 ||
+        info.attributes & (FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_OFFLINE|
+            FILE_ATTRIBUTE_RECALL_ON_OPEN|FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)!=0 {
+        return Err("FRN mudou, tem hardlinks ou é conteúdo virtual".into());
+    }
+    let mut path=vec![0u16;32768];
+    let count=unsafe {
+        GetFinalPathNameByHandleW(handle.0,path.as_mut_ptr(),path.len() as u32,0)
+    } as usize;
+    if count==0 || count>=path.len() {
+        return Err("Caminho por FRN indisponível".into());
+    }
+    Ok((PathBuf::from(OsString::from_wide(&path[..count])),info))
+}
+
+/// Conservative changed-file extraction from a retained journal interval.
+/// Structural changes and unsupported records always cause full reindexing.
+/// Never trusts USN file names alone or treats one FRN as multiple hardlinks.
+pub fn file_changes_since(root:&Path,old:Cursor)->Result<NativeDelta,String> {
+    use std::collections::BTreeMap;
+    let (volume,_)=open_ntfs_volume(root)?;
+    let j=journal(&volume)?;
+    let root_info=file_info(root)?;
+    let current=Cursor {
+        journal_id:j.journal_id,
+        first_usn:j.first_usn.max(j.lowest_valid_usn),
+        next_usn:j.next_usn,
+        volume_serial:root_info.volume_serial,
+        root_file_id:root_info.file_index(),
+    };
+    if !current.retains(&old) {
+        return Err("USN não contínuo, volume ou raiz alterados".into());
+    }
+    const STRUCTURAL:u32=0x00000100|0x00000200|0x00001000|0x00002000|
+        0x00010000|0x00100000;
+    let mut changed=BTreeMap::<PathBuf,u64>::new();
+    let mut start=old.next_usn;
+    let mut buffer=vec![0u8;BUFFER_BYTES];
+    let mut count=0usize;
+    while start<current.next_usn {
+        let input=ReadUsnDataV0 {
+            start_usn:start,reason_mask:u32::MAX,return_only_on_close:0,
+            timeout:0,bytes_to_wait_for:0,journal_id:old.journal_id,
+        };
+        let read=ioctl(&volume,FSCTL_READ_USN_JOURNAL,Some(&input),&mut buffer)
+            .map_err(|e|format!("USN read: {e}"))?;
+        let next=records(&buffer[..read],|record|{
+            if read_u16(record,4)!=Some(2) {return Err("USN V2 obrigatório".into());}
+            let usn=read_u64(record,24).ok_or("USN ausente")? as i64;
+            if usn>=current.next_usn {return Ok(());}
+            let reason=read_u32(record,40).ok_or("USN reason ausente")?;
+            let attr=read_u32(record,52).ok_or("Atributos USN ausentes")?;
+            if reason & !USN_REASON_CLOSE==0 {return Ok(());}
+            count+=1;
+            if count>20_000 {return Err("Muitas alterações no journal".into());}
+            if reason & STRUCTURAL!=0 || attr & FILE_ATTRIBUTE_DIRECTORY!=0 {
+                return Err("Alteração estrutural de diretório, nome ou hardlink".into());
+            }
+            if attr & (FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_OFFLINE|
+                FILE_ATTRIBUTE_RECALL_ON_OPEN|FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)!=0 {
+                return Err("Mudança virtual/offline requer reindexação completa".into());
+            }
+            let frn=read_u64(record,8).ok_or("FRN de evento inválido")?;
+            let (path,_)=path_by_frn(&volume,frn)?;
+            if path.starts_with(root) {
+                changed.insert(path,frn);
+                if changed.len()>2048 {
+                    return Err("Mais de 2048 arquivos alterados; fallback".into());
+                }
+            }
+            Ok(())
+        })?;
+        let next=next as i64;
+        if next<=start {return Err("USN não avançou".into());}
+        start=next;
+    }
+    Ok(NativeDelta {changed_files:changed.into_iter().collect(),watermark:current})
+}
+pub fn path_still_matches_filereference(path:&Path,frn:u64)->bool {
+    file_info(path).is_ok_and(|info|info.file_index()==frn
+        && info.number_of_links==1
+        && info.attributes & (FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_OFFLINE|
+            FILE_ATTRIBUTE_RECALL_ON_OPEN|FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)==0)
+}
+
 pub struct Enumeration { pub paths:Vec<(PathBuf,bool)>, pub checkpoint:Cursor }
 /// MFT-based path enumeration. Only use when journal remains unchanged and
 /// *every* file in requested subtree has one hardlink and valid metadata.
@@ -401,6 +520,14 @@ fn file_info(path:&Path)->Result<ByHandleFileInformation,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn windows_ffi_layouts_match_ntfs_v0_structures() {
+        assert_eq!(std::mem::size_of::<MftEnumDataV0>(),24);
+        assert_eq!(std::mem::size_of::<JournalDataV0>(),56);
+        assert_eq!(std::mem::size_of::<ReadUsnDataV0>(),40);
+        assert_eq!(std::mem::size_of::<FileIdDescriptor>(),24);
+    }
+
     #[test]
     fn journal_watermark_rejects_gaps_and_new_ids() {
         let old=Cursor{journal_id:7,first_usn:1,next_usn:120,

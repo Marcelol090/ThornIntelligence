@@ -162,7 +162,8 @@ pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
           root TEXT PRIMARY KEY,
           generation INTEGER NOT NULL,
           completed_at_unix INTEGER NOT NULL,
-          file_count INTEGER NOT NULL
+          file_count INTEGER NOT NULL,
+          revision INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS indexed_files (
           root TEXT NOT NULL,
@@ -220,6 +221,24 @@ pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
             )).map_err(db_err)?;
         }
     }
+    // Generation marks rows belonging to a full scan. Revision marks
+    // an API-visible tree version and increments for bounded USN deltas.
+    // This avoids rewriting millions of generation values for one file edit.
+    let has_revision = {
+        let mut stmt=conn.prepare("PRAGMA table_info(indexed_scopes)").map_err(db_err)?;
+        let columns=stmt.query_map([],|r|r.get::<_,String>(1)).map_err(db_err)?;
+        let mut found=false;
+        for column in columns {
+            if column.map_err(db_err)?=="revision" {found=true;}
+        }
+        found
+    };
+    if !has_revision {
+        conn.execute_batch(
+            "ALTER TABLE indexed_scopes
+             ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;"
+        ).map_err(db_err)?;
+    }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_indexed_files_children
           ON indexed_files(root,parent_path,generation,size_bytes DESC,path);"
@@ -253,6 +272,149 @@ fn wait_indexer(
         progress(ScanProgress { phase: "indexing".into(), files_scanned: files, hash_bytes_read: 0 });
     }
     Ok(())
+}
+
+/// Apply one in-place metadata change to the published file and directory
+/// aggregates. The caller owns a transaction; any error rolls it all back.
+fn update_existing_file(
+    tx: &rusqlite::Transaction<'_>,
+    root: &str, generation: i64, path: &Path,
+    size: i64, modified: i64, flags: i64,
+) -> Result<bool,String> {
+    if size<0 || !path.starts_with(Path::new(root)) {
+        return Err("Delta USN fora do escopo ou tamanho inválido".into());
+    }
+    let filename=path.to_string_lossy().into_owned();
+    let parent=path.parent().ok_or("Pai USN ausente")?
+        .to_string_lossy().into_owned();
+    let old:Option<(i64,i64,i64,String)>=tx.query_row(
+        "SELECT size_bytes,modified_ns,attributes,parent_path FROM indexed_files
+         WHERE root=?1 AND path=?2 AND generation=?3",
+        params![root,filename,generation],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional().map_err(db_err)?;
+    let (old_size,old_mtime,old_flags,old_parent)=old
+        .ok_or("Evento USN de arquivo ausente no snapshot: reindexação necessária")?;
+    if old_parent!=parent || old_size<0 {
+        return Err("Parent alterado; delta simples insuficiente".into());
+    }
+    if (old_size,old_mtime,old_flags)==(size,modified,flags) {return Ok(false);}
+    let diff=size.checked_sub(old_size).ok_or("Delta de tamanho estourou o intervalo")?;
+    if diff!=0 {
+        for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
+            if !ancestor.starts_with(Path::new(root)) {break;}
+            let dirname=ancestor.to_string_lossy().into_owned();
+            let existing:Option<i64>=tx.query_row(
+                "SELECT logical_bytes FROM indexed_directories
+                 WHERE root=?1 AND path=?2 AND generation=?3",
+                params![root,dirname,generation],|r|r.get(0),
+            ).optional().map_err(db_err)?;
+            let bytes=existing.ok_or("Agregado de pasta não encontrado")?;
+            let next=bytes.checked_add(diff)
+                .filter(|n|*n>=0).ok_or("Agregado de pasta fora do intervalo")?;
+            let updated=tx.execute(
+                "UPDATE indexed_directories SET logical_bytes=?1
+                 WHERE root=?2 AND path=?3 AND generation=?4",
+                params![next,root,dirname,generation],
+            ).map_err(db_err)?;
+            if updated!=1 {return Err("Agregado modificado concorrentemente".into());}
+            if ancestor==Path::new(root) {break;}
+        }
+    }
+    let updated=tx.execute(
+        "UPDATE indexed_files SET size_bytes=?1,modified_ns=?2,attributes=?3
+         WHERE root=?4 AND path=?5 AND generation=?6",
+        params![size,modified,flags,root,filename,generation],
+    ).map_err(db_err)?;
+    if updated!=1 {return Err("Arquivo USN não encontrado".into());}
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn cached_ntfs_delta(db_path: &Path,root:&Path)->Option<IndexStats> {
+    use rusqlite::OpenFlags;
+    if !db_path.is_file() {return None;}
+    let started=Instant::now();
+    let root_name=root.to_string_lossy().into_owned();
+    let readonly=Connection::open_with_flags(
+        db_path,OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).ok()?;
+    readonly.busy_timeout(Duration::from_secs(3)).ok()?;
+    let (generation,revision,count): (i64,i64,i64)=readonly.query_row(
+        "SELECT generation,revision,file_count
+         FROM indexed_scopes WHERE root=?1",
+        params![root_name],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional().ok()??;
+    if generation<=0 || count<0 {return None;}
+    let valid_tree:bool=readonly.query_row(
+        "SELECT EXISTS(SELECT 1 FROM indexed_directories
+         WHERE root=?1 AND path=?1 AND generation=?2)",
+        params![root_name,generation],|r|r.get(0),
+    ).ok()?;
+    if !valid_tree {return None;}
+    let (jid,from_usn,serial,file_id):(String,i64,i64,String)=readonly.query_row(
+        "SELECT journal_id,from_usn,volume_serial,root_file_id
+         FROM indexed_ntfs_checkpoint WHERE root=?1",
+        params![root_name],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional().ok()??;
+    if serial<0 || serial>u32::MAX as i64 || from_usn<0 {return None;}
+    let previous=crate::ntfs_native::Cursor {
+        journal_id:u64::from_str_radix(&jid,16).ok()?,
+        first_usn:0,next_usn:from_usn,
+        volume_serial:serial as u32,
+        root_file_id:u64::from_str_radix(&file_id,16).ok()?,
+    };
+    drop(readonly);
+    let delta=crate::ntfs_native::file_changes_since(root,previous).ok()?;
+    if delta.changed_files.len()>2048 {return None;}
+    let mut conn=connection(db_path).ok()?;
+    let tx=conn.transaction().ok()?;
+    let current:(i64,i64)=tx.query_row(
+        "SELECT generation,revision FROM indexed_scopes WHERE root=?1",
+        params![root_name],|r|Ok((r.get(0)?,r.get(1)?)),
+    ).ok()?;
+    if current!=(generation,revision) {return None;}
+    let mut changed=0usize;
+    for (path,frn) in &delta.changed_files {
+        if !path.starts_with(root) {return None;}
+        let metadata=std::fs::symlink_metadata(path).ok()?;
+        let flags=u64::from(attributes(&metadata));
+        if !metadata.is_file() || flags & (0x400|0x1000|0x40000|0x400000)!=0 {
+            return None;
+        }
+        if !crate::ntfs_native::path_still_matches_filereference(path,*frn) {
+            return None;
+        }
+        let size=i64::try_from(metadata.len()).ok()?;
+        let changed_row=update_existing_file(
+            &tx,&root_name,generation,path,size,mtime_ns(&metadata),flags as i64,
+        ).ok()?;
+        changed+=usize::from(changed_row);
+    }
+    let next_rev=revision.checked_add(1)?;
+    let done=now_unix();
+    tx.execute(
+        "UPDATE indexed_scopes
+         SET revision=?1,completed_at_unix=?2 WHERE root=?3",
+        params![next_rev,done,root_name],
+    ).ok()?;
+    tx.execute(
+        "UPDATE indexed_ntfs_checkpoint
+         SET from_usn=?1,journal_id=?2,volume_serial=?3,root_file_id=?4
+         WHERE root=?5",
+        params![delta.watermark.next_usn,
+            format!("{:016x}",delta.watermark.journal_id),
+            i64::from(delta.watermark.volume_serial),
+            format!("{:016x}",delta.watermark.root_file_id),root_name],
+    ).ok()?;
+    tx.commit().ok()?;
+    Some(IndexStats {
+        root:root_name,files:count as usize,
+        added:0,changed,unchanged:(count as usize).saturating_sub(changed),
+        removed:0,skipped_directories:0,completed_at_unix:done,
+        elapsed_ms:started.elapsed().as_millis(),batches_written:1,
+        index_method:"usn_delta".into(),
+    })
 }
 
 #[cfg(windows)]
@@ -343,18 +505,30 @@ fn refresh_inner(
             });
         }
     }
+    #[cfg(windows)]
+    if allow_native && max_files.is_none()
+        && !cancel.load(Ordering::Relaxed) && !paused.load(Ordering::Relaxed) {
+        if let Some(stats)=cached_ntfs_delta(db_path,&root) {
+            progress(ScanProgress {
+                phase:"complete".into(),files_scanned:stats.files,hash_bytes_read:0,
+            });
+            return Ok(stats);
+        }
+    }
     let mut conn = connection(db_path)?;
 
     // The previous snapshot is never modified until final publication.
     // Do not touch staging before testing the USN shortcut. That DELETE
     // itself may generate USN events on the same volume and force a false
     // "changes detected" result on every refresh.
-    let old_generation: i64 = conn.query_row(
-        "SELECT generation FROM indexed_scopes WHERE root = ?1",
-        params![root_str], |row| row.get(0),
-    ).optional().map_err(db_err)?.unwrap_or(0);
+    let (old_generation,old_revision): (i64,i64) = conn.query_row(
+        "SELECT generation,revision FROM indexed_scopes WHERE root = ?1",
+        params![root_str], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional().map_err(db_err)?.unwrap_or((0,0));
     let generation = old_generation.checked_add(1)
         .ok_or("Contador de gerações do índice esgotado.")?;
+    let revision = old_revision.checked_add(1)
+        .ok_or("Contador de revisões do índice esgotado.")?;
 
     // This watermark precedes both native and fallback enumeration. On the
     // next refresh, changes during staging are included in the USN interval.
@@ -579,13 +753,14 @@ fn refresh_inner(
     }
     let completed_at_unix = now_unix();
     tx.execute(
-        "INSERT INTO indexed_scopes(root,generation,completed_at_unix,file_count)
-         VALUES(?1,?2,?3,?4)
+        "INSERT INTO indexed_scopes(root,generation,completed_at_unix,file_count,revision)
+         VALUES(?1,?2,?3,?4,?5)
          ON CONFLICT(root) DO UPDATE SET
              generation=excluded.generation,
              completed_at_unix=excluded.completed_at_unix,
-             file_count=excluded.file_count",
-        params![root_str, generation, completed_at_unix, files as i64],
+             file_count=excluded.file_count,
+             revision=excluded.revision",
+        params![root_str, generation, completed_at_unix, files as i64, revision],
     ).map_err(db_err)?;
     tx.execute("DELETE FROM indexed_stage WHERE root=?1", params![root_str])
         .map_err(db_err)?;
@@ -740,12 +915,12 @@ pub fn browse_tree(db_path: &Path, request: TreeRequest) -> Result<TreePage, Str
     // SQLite WAL snapshot: the generation, folder children and file children
     // must all refer to the same committed index version.
     let tx = conn.transaction().map_err(db_err)?;
-    let (generation,completed_at_unix): (i64,i64) = tx.query_row(
-        "SELECT generation,completed_at_unix FROM indexed_scopes WHERE root=?1",
-        params![root], |r| Ok((r.get(0)?,r.get(1)?))
+    let (generation,completed_at_unix,revision): (i64,i64,i64) = tx.query_row(
+        "SELECT generation,completed_at_unix,revision FROM indexed_scopes WHERE root=?1",
+        params![root], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
     ).optional().map_err(db_err)?
         .ok_or("Nenhum índice publicado para esta pasta. Use Atualizar índice SQLite.")?;
-    if request.generation.is_some_and(|value| value != generation) {
+    if request.generation.is_some_and(|value| value != revision) {
         return Err("O índice foi atualizado. Reabra a árvore para carregar a geração atual.".into());
     }
     let exists: bool = tx.query_row(
@@ -827,7 +1002,7 @@ pub fn browse_tree(db_path: &Path, request: TreeRequest) -> Result<TreePage, Str
     tx.commit().map_err(db_err)?;
     Ok(TreePage {
         root,parent_path:request.parent_path,nodes,next_cursor,
-        completed_at_unix,generation,
+        completed_at_unix,generation:revision,
     })
 }
 
@@ -870,6 +1045,75 @@ mod tests {
         let db=tmp.path().join("not-created.sqlite");
         assert!(browse_tree(&db,tree_req(&root,&root,100,None,None)).is_err());
         assert!(!db.exists());
+    }
+
+    #[test]
+    fn in_place_usn_metadata_delta_updates_tree_aggregates_and_invalidates_cursor() {
+        let tmp=tempfile::tempdir().unwrap();
+        let root=tmp.path().join("scope");
+        let inner=root.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let file=inner.join("data.bin");
+        fs::write(&file,b"123").unwrap();
+        let db=tmp.path().join("index.sqlite");
+        refresh(&db,root.to_str().unwrap(),None,&AtomicBool::new(false),
+            &AtomicBool::new(false), |_| {}).unwrap();
+        let before=browse_tree(&db,tree_req(&root,&root,100,None,None)).unwrap();
+        assert_eq!(before.nodes[0].size_bytes,3);
+        fs::write(&file,b"123456789").unwrap();
+        let metadata=fs::symlink_metadata(&file).unwrap();
+        let mut conn=connection(&db).unwrap();
+        let gen:i64=conn.query_row(
+            "SELECT generation FROM indexed_scopes WHERE root=?1",
+            params![root.display().to_string()],|r|r.get(0),
+        ).unwrap();
+        let tx=conn.transaction().unwrap();
+        let changed=update_existing_file(
+            &tx,&root.display().to_string(),gen,&file,metadata.len() as i64,
+            mtime_ns(&metadata),i64::from(attributes(&metadata)),
+        ).unwrap();
+        assert!(changed);
+        tx.execute(
+            "UPDATE indexed_scopes SET revision=revision+1 WHERE root=?1",
+            params![root.display().to_string()],
+        ).unwrap();
+        tx.commit().unwrap();
+        let after=browse_tree(&db,tree_req(&root,&root,100,None,None)).unwrap();
+        assert_eq!(after.nodes[0].size_bytes,9);
+        let inner_page=browse_tree(&db,tree_req(&root,&inner,100,None,None)).unwrap();
+        assert_eq!(inner_page.nodes[0].size_bytes,9);
+        assert!(browse_tree(&db,tree_req(
+            &root,&root,100,None,Some(before.generation),
+        )).is_err());
+    }
+
+    #[test]
+    fn failed_delta_rolls_back_file_and_folder_updates() {
+        let tmp=tempfile::tempdir().unwrap();
+        let root=tmp.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        let file=root.join("a");
+        fs::write(&file,b"abc").unwrap();
+        let db=tmp.path().join("index.sqlite");
+        refresh(&db,root.to_str().unwrap(),None,&AtomicBool::new(false),
+            &AtomicBool::new(false), |_| {}).unwrap();
+        let mut conn=connection(&db).unwrap();
+        let gen:i64=conn.query_row(
+            "SELECT generation FROM indexed_scopes WHERE root=?1",
+            params![root.display().to_string()],|r|r.get(0),
+        ).unwrap();
+        {
+            let tx=conn.transaction().unwrap();
+            assert!(update_existing_file(
+                &tx,&root.display().to_string(),gen,&file,100,0,0,
+            ).unwrap());
+            assert!(update_existing_file(
+                &tx,&root.display().to_string(),gen,&root.join("absent"),1,0,0,
+            ).is_err());
+            // No commit: the entire batch is rolled back.
+        }
+        let page=browse_tree(&db,tree_req(&root,&root,100,None,None)).unwrap();
+        assert_eq!(page.nodes[0].size_bytes,3);
     }
 
     #[test]
