@@ -151,3 +151,24 @@ Never recommend destructive optimization based solely on timing anecdotes.
 - CI timing caveats: https://nexte.st/docs/integrations/criterion/
 
 No performance improvement in this document is claimed as already measured.
+
+
+## Monitor the live desktop application (Tauri + WebView2)
+
+~~~powershell
+# Attach to the running process for a finite 60-second capture:
+pwsh -File .\scripts\perf\monitor-app.ps1 -ProcessName thorn-intelligence -DurationSeconds 60 -IntervalMs 1000
+
+# Or use the exact PID from Task Manager:
+pwsh -File .\scripts\perf\monitor-app.ps1 -ProcessId 12345 -DurationSeconds 30
+~~~
+
+The CSV includes UTC time, process-tree size, sampled CPU-percent-of-one-core,
+working set/private bytes, handle count, thread count and logical I/O
+transfer counts. It includes descendant WebView2 processes where accessible.
+Counters are observational and approximate; an exited child may cause
+cumulative values to drop. No tracing service or background watcher is left
+running after the requested duration. Run UI navigation, scrolling,
+searching and duplicate scans while capturing. For actual frame time/jank
+use WebView2/Chrome Performance DevTools and native ETW instead of inferring
+FPS from process CPU.
