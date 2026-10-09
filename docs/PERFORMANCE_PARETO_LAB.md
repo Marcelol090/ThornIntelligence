@@ -33,7 +33,7 @@ user files. Rust scenario timings exclude compilation and fixture creation.
 | tree_all_pages | Paginate entire root tree | Exactly 32 direct children |
 
 Default: 1,500 synthetic files and five repetitions. Environment settings:
-THORN_PERF_FILES (100..120000) and THORN_PERF_REPEAT (2..30). Files include
+THORN_PERF_FILES (100..350000) and THORN_PERF_REPEAT (2..30). Files include
 real duplicate content and identical head/tail with different middle content.
 The test suite asserts full BLAKE3; a partial fingerprint never certifies
 a duplicate. The release runner captures p50, p95, min/max, logical hash-read
@@ -113,7 +113,7 @@ but is too noisy for binding microbenchmark SLAs.
 
 | Workload | Risk checked |
 |---|---|
-| 100, 1500, 50000, 120000 files | Nonlinear growth and RSS limits |
+| 100, 1500, 50000, 120000, 300001 files | Nonlinear growth and RSS limits |
 | Flat vs 32+ deeply nested directories | Walker parallelism crossover |
 | 256B, 64KiB, 4MiB, multi-GB content | BLAKE3, I/O budgets and CPU saturation |
 | Identical edge fingerprints, different centers | No false positives |
@@ -172,3 +172,15 @@ running after the requested duration. Run UI navigation, scrolling,
 searching and duplicate scans while capturing. For actual frame time/jank
 use WebView2/Chrome Performance DevTools and native ETW instead of inferring
 FPS from process CPU.
+
+
+### Large-file-count safety note
+
+To regress the old 250,000-file ceiling, invoke
+pwsh -File .\scripts\perf\run-windows.ps1 -Files 300001 -Repeats 2
+only on a disposable test volume with sufficient disk space and time.
+Above 120,000 fixtures, the generator uses small unique/duplicate payloads
+rather than 64 KiB special files to limit disk consumption. Run additional
+separate functional tests for large-file head/tail collisions. The initial
+index-build scenario is measured only once per benchmark run: repeat entire
+runs for that scenario instead of treating one measurement as p95 evidence.
