@@ -35,3 +35,21 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
       - name: Rust compile check
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+  perf-lab-smoke:
+    name: Pareto analyzer and query strategy smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit check Pareto comparison
+        run: python scripts/perf/pareto.py --self-test
+      - name: Verify equivalent search results in SQLite strategies
+        run: python scripts/perf/structure-lab.py --files 250 --repeats 2 --output reports/performance/lab-smoke.json
+      - name: Verify SQLite read-only diagnostic with disposable file
+        shell: bash
+        run: |
+          python -c "import sqlite3; x=sqlite3.connect('test-health.sqlite'); x.execute('create table x(a)'); x.close()"
+          python scripts/perf/sqlite-health.py --database test-health.sqlite --simulate-vacuum --quick-check
