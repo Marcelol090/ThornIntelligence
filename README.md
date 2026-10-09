@@ -233,3 +233,36 @@ A auditoria rejeita redirecionamento do diretório raiz, valida UUIDs do manifes
 A faixa **Escopo atual** agora mostra imediatamente a pasta efetivamente selecionada enquanto o scanner está trabalhando, com estado `ANALISANDO`, mesmo antes de existir um `ScanReport`. O estado `activeScanRoot` é separado de `report.root`: cancelar ou falhar a operação restaura automaticamente a indicação do último relatório concluído, sem apagar os dados anteriores. Não é exibida uma porcentagem inventada durante enumerações sem total conhecido.
 
 A motivação foi a captura da interface com `51.971 arquivos processados` mas `Nenhuma pasta selecionada`. Pesquisa prévia Exa sobre feedback de scanners: [rdirstat](https://github.com/AndyGybels/rdirstat), [ZDirMap](https://github.com/TheHolyOneZ/ZDirMap) e [WizTree changelog](https://diskanalyzer.com/download). Testar no Windows: iniciar escopo novo, cancelar com e sem relatório anterior e terminar com sucesso.
+
+## BLAKE3 de alto desempenho — pipeline com amostragem de bordas (08/10/2026)
+
+Motivação: relatos de varreduras demorando mais de 10 minutos para um inventário lógico de aproximadamente 50 GB. **Sem benchmark no equipamento-alvo não se pode atribuir todo esse tempo ao BLAKE3**: enumerar arquivos, a latência do armazenamento e antivírus também influenciam. Antes desta mudança, o `ScanReport.logicalBytes` (volume total de arquivos) não correspondia ao `hashBytesRead` real e o scanner utilizava `read()` de 64 KiB, de forma sequencial. Nenhum relatório deve interpretar 50 GB lógicos como 50 GB de conteúdo efetivamente hasheado.
+
+### Alterações
+
+1. **Prefiltro confiável com início e fim:** agrupa por tamanho, lê em uma única abertura os primeiros e os últimos 16 KiB de cada arquivo candidato (máximo 32 KiB; arquivos menores de 32 KiB são inteiramente amostrados, sem regiões sobrepostas). Padrão inspirado em Czkawka. Arquivos com amostras diferentes são descartados sem leitura integral. **Duas amostras idênticas NÃO confirmam duplicidade:** o conteúdo integral continua sendo hasheado, e hardlinks são excluídos da estimativa de economia.
+2. **Leitor BLAKE3 sequencial de 4 MiB**, alocado no heap, com suporte ao `Hasher::update_rayon` para paralelizar somente os dados já carregados na memória. Não utiliza diversos leitores aleatórios ou mmap concorrente: isso evita o thrashing documentado em HDDs. Leitura e processamento continuam com um só arquivo por vez. O uso de Rayon pode ser favorável em CPU/SSD, mas deve ser medido em cada dispositivo; não é promessa de aceleração.
+3. **Progresso durante arquivos grandes:** o backend notifica o frontend sobre o total de bytes realmente retornados por `read()` ao processar cada bloco, no máximo uma emissão aproximadamente a cada 250 ms. Cancelamento é conferido entre blocos, mantendo a contagem de bytes já lidos mesmo se a operação falhar. A mesma melhoria foi aplicada ao comparador entre pastas.
+4. **Telemetria separada:** o relatório informa `fingerprintBytesRead`, `fingerprintElapsedMs`, `fullHashBytesRead`, `fullHashElapsedMs`, e o orçamento. A interface calcula MiB/s apenas para a etapa integral, com base nos bytes entregues ao aplicativo: **não são IOPS nem velocidade física de disco**.
+5. **Orçamento BLAKE3 explícito no scanner:** Equilibrado (8 GiB, comportamento anterior), Profundo (64 GiB) e Sem limite (opt-in, pode saturar disco por longos períodos). O orçamento controla somente leituras de conteúdo, não a contagem de arquivos e nem o espaço lógico. O comparador de duas pastas mantém o próprio orçamento separado de 8 GiB nesta etapa.
+
+### Segurança e correção
+
+- Metadados Windows `OFFLINE`, `REPARSE_POINT`, `RECALL_ON_OPEN` e `RECALL_ON_DATA_ACCESS` continuam impedindo abertura/leitura de placeholders. O algoritmo não hidrata OneDrive conscientemente.
+- Tamanho e `mtime` são reconferidos antes e depois das leituras, inclusive após o `seek` da amostra do final. O relatório não marca cópias como verificadas apenas com a amostra.
+- O consumo de memória do buffer é limitado a 4 MiB por operação de hash mais o overhead da biblioteca Rayon. Leitura física do dispositivo e cache de páginas do sistema operacional podem divergir de `hashBytesRead`.
+- Casos de teste Rust cobrem os mesmos bytes do BLAKE3 de referência em múltiplos blocos, cancelamento entre blocos, arquivos com amostras iguais e miolo diferente, arquivos com cabeçalhos iguais e finais diferentes, contabilização de I/O e os orçamentos explícitos. **Não foram compilados nem executados em Windows**.
+
+### Benchmark recomendado antes/depois
+
+Em um escopo **de teste** com arquivos grandes locais e sem nuvem, medir: tempo total, duração da etapa de prefixos, duração do hash integral, bytes de cada etapa, MiB/s calculado, taxa de uso de HDD/SSD/NVMe, atividade do Defender e temperatura. Comparar execuções com cache frio e quente; não excluir ou desativar o antivírus globalmente. Nunca comparar volume lógico total com bytes hasheados sem distinguir as métricas. Testar tanto arquivos com mesmos prefixos mas caudas diferentes quanto cópias realmente idênticas. Considerar carga CPU, banda do disco e necessidade de maior orçamento.
+
+### Fontes pesquisadas com Exa
+
+- [BLAKE3 Rust Hasher: update/update_rayon](https://docs.rs/blake3/latest/blake3/struct.Hasher.html)
+- [BLAKE3: regressão de leituras simultâneas em HDD #31](https://github.com/BLAKE3-team/BLAKE3/issues/31)
+- [Czkawka: descrição das amostras do início/fim e hash integral](https://github.com/qarmin/czkawka/blob/master/instructions/Instruction_Core.md)
+- [Czkawka: melhoria de buffers grandes](https://medium.com/@qarmin/czkawka-krokiet-9-0-find-duplicates-faster-than-ever-before-c284ceaaad79)
+- [Microsoft Defender: desempenho das varreduras](https://learn.microsoft.com/en-us/defender-endpoint/mdav-scan-best-practices)
+
+A PR precisa passar `npm run build`, `cargo fmt --check`, `cargo test`, `cargo check`, além de ensaio Windows real. O GitHub Actions atualmente não inicia jobs; não alegar ganhos numéricos sem medição.

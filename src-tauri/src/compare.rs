@@ -1,7 +1,7 @@
 //! Read-only comparison: files under a candidate folder that have an exact
 //! BLAKE3 match under a separate, explicitly selected reference folder.
 //! A match is never an authorization to delete or move either file.
-use crate::scan::{avoid_content_read, content_hash_with_cancel, ScanProgress};
+use crate::scan::{avoid_content_read, content_hash_with_progress, ScanProgress};
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -43,6 +43,7 @@ pub struct CompareReport {
     pub matches: Vec<CompareMatch>,
     pub potential_logical_savings_bytes: u64,
     pub hash_bytes_read: u64,
+    pub hash_stage_elapsed_ms: u128,
     pub skipped_cloud_files: usize,
     pub hardlink_aliases: usize,
     pub errors: usize,
@@ -196,6 +197,7 @@ pub fn compare_with_control(
     let total_files = master.files.len() + candidate_side.files.len();
     let mut last_event = Instant::now();
 
+    let hash_started = Instant::now();
     // A candidate must have the same length as at least one reference.
     let candidate_sizes: HashSet<u64> = candidate_side.files.iter().map(|f| f.size).collect();
     let mut master_files: Vec<&FileRecord> = master.files.iter()
@@ -222,7 +224,19 @@ pub fn compare_with_control(
             complete = false;
             continue;
         }
-        let (digest, consumed) = content_hash_with_cancel(&file.path, file.size, cancel);
+        let previous_bytes = hash_bytes_read;
+        // During large files, emit progress from inside the sequential reader.
+        let (digest, consumed) = content_hash_with_progress(
+            &file.path, file.size, cancel, |current| {
+                if last_event.elapsed() >= Duration::from_millis(250) {
+                    progress(ScanProgress {
+                        phase: "hashing".into(), files_scanned: total_files,
+                        hash_bytes_read: previous_bytes.saturating_add(current),
+                    });
+                    last_event = Instant::now();
+                }
+            },
+        );
         hash_bytes_read = hash_bytes_read.saturating_add(consumed);
         ensure_active(cancel)?;
         match digest {
@@ -263,7 +277,19 @@ pub fn compare_with_control(
             complete = false;
             continue;
         }
-        let (digest, consumed) = content_hash_with_cancel(&file.path, file.size, cancel);
+        let previous_bytes = hash_bytes_read;
+        // During large files, emit progress from inside the sequential reader.
+        let (digest, consumed) = content_hash_with_progress(
+            &file.path, file.size, cancel, |current| {
+                if last_event.elapsed() >= Duration::from_millis(250) {
+                    progress(ScanProgress {
+                        phase: "hashing".into(), files_scanned: total_files,
+                        hash_bytes_read: previous_bytes.saturating_add(current),
+                    });
+                    last_event = Instant::now();
+                }
+            },
+        );
         hash_bytes_read = hash_bytes_read.saturating_add(consumed);
         ensure_active(cancel)?;
         let digest = match digest {
@@ -340,6 +366,7 @@ pub fn compare_with_control(
         }
     }
     ensure_active(cancel)?;
+    let hash_stage_elapsed_ms = hash_started.elapsed().as_millis();
     let results = results.into_iter().rev().map(|(_, item)| item).collect();
     progress(ScanProgress {
         phase: "complete".into(), files_scanned: total_files, hash_bytes_read,
@@ -353,6 +380,7 @@ pub fn compare_with_control(
         matches: results,
         potential_logical_savings_bytes: savings,
         hash_bytes_read,
+        hash_stage_elapsed_ms,
         skipped_cloud_files,
         hardlink_aliases,
         errors,
