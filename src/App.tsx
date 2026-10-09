@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ComponentType, type CSSProperties, type FormEvent, type ReactNode } from 'react';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { Effect, EffectState, getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -12,6 +12,22 @@ import {
 import type { IndexedScope, IndexStats, IndexedSearch, QuarantinePreview, QuarantineItem, QuarantineAuditReport, CompareReport, CompareRequest, AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
 import { IndexedTree } from './components/IndexedTree';
+
+type AppearanceAccent = 'lilac' | 'mint' | 'coral' | 'blue';
+type AppearanceDensity = 'comfortable' | 'compact';
+type AppearanceFrame = 'edge' | 'framed';
+function storedAppearance<T extends string>(key: string, valid: readonly T[], fallback: T): T {
+  try {
+    const stored = localStorage.getItem(key);
+    return valid.find(value => value === stored) ?? fallback;
+  } catch { return fallback; }
+}
+function storedGlassLevel(): number {
+  try {
+    const stored = Number(localStorage.getItem('thorn.appearance.glass'));
+    return Number.isFinite(stored) && stored >= 20 && stored <= 85 ? stored : 50;
+  } catch { return 50; }
+}
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
 const links: { id: Section; label: string; icon: IconType }[] = [
@@ -150,6 +166,15 @@ export default function App() {
     try { return localStorage.getItem('thorn.clarity-mode') === 'true'; }
     catch { return false; }
   });
+  const [accent, setAccent] = useState<AppearanceAccent>(() =>
+    storedAppearance('thorn.appearance.accent', ['lilac', 'mint', 'coral', 'blue'] as const, 'lilac'));
+  const [density, setDensity] = useState<AppearanceDensity>(() =>
+    storedAppearance('thorn.appearance.density', ['comfortable', 'compact'] as const, 'comfortable'));
+  const [frame, setFrame] = useState<AppearanceFrame>(() =>
+    storedAppearance('thorn.appearance.frame', ['edge', 'framed'] as const, 'edge'));
+  const [glassLevel, setGlassLevel] = useState(storedGlassLevel);
+  const appearanceRef = useRef<HTMLDetailsElement>(null);
+  const contentScrollRef = useRef<HTMLElement>(null);
   const [nativeMaterial, setNativeMaterial] = useState<'Acrylic' | 'Mica'>('Acrylic');
   const [windowEffectStatus, setWindowEffectStatus] = useState<'pending' | 'requested' | 'failed'>('pending');
   const [windowEffectError, setWindowEffectError] = useState('');
@@ -213,6 +238,34 @@ export default function App() {
     try { localStorage.setItem('thorn.clarity-mode', String(clarityMode)); }
     catch { /* local-only preference may be unavailable */ }
   }, [clarityMode]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('thorn.appearance.accent', accent);
+      localStorage.setItem('thorn.appearance.density', density);
+      localStorage.setItem('thorn.appearance.frame', frame);
+      localStorage.setItem('thorn.appearance.glass', String(glassLevel));
+    } catch { /* Preferences are optional if storage is restricted. */ }
+  }, [accent, density, frame, glassLevel]);
+  useEffect(() => {
+    const dismissOnOutsideClick = (event: PointerEvent) => {
+      if (!appearanceRef.current?.contains(event.target as Node)) {
+        appearanceRef.current?.removeAttribute('open');
+      }
+    };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && appearanceRef.current?.open) {
+        appearanceRef.current.open = false;
+        appearanceRef.current.querySelector('summary')?.focus();
+      }
+    };
+    document.addEventListener('pointerdown', dismissOnOutsideClick);
+    document.addEventListener('keydown', dismissOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', dismissOnOutsideClick);
+      document.removeEventListener('keydown', dismissOnEscape);
+    };
+  }, []);
 
   async function copy(value: string) {
     try { await navigator.clipboard.writeText(value); setToast('Caminho copiado.'); }
@@ -621,6 +674,7 @@ export default function App() {
   }
 
   function selectSection(value: Section) {
+    contentScrollRef.current?.scrollTo({ top: 0, behavior: 'auto' });
     setSection(value);
     setError('');
     setMobileMenu(false);
@@ -632,7 +686,12 @@ export default function App() {
   const roots = activeScanRoot ?? report?.root ?? '';
   const scopeName = roots ? (roots.split(/[\\/]/).filter(Boolean).pop() ?? roots) : 'Nenhuma pasta selecionada';
 
-  return <div className={'app-shell glass-studio' + (railExpanded ? ' rail-expanded' : '') + (clarityMode ? ' clarity-mode' : '')}>
+  return <div
+    className={'app-shell glass-studio' + (railExpanded ? ' rail-expanded' : '') + (clarityMode ? ' clarity-mode' : '')}
+    data-accent={accent} data-density={density} data-frame={frame}
+    style={{ '--studio-panel-alpha': (glassLevel / 100).toFixed(2) } as CSSProperties}>
+    {mobileMenu && <button type="button" className="sidebar-scrim" aria-label="Fechar menu de navegação"
+      onClick={() => setMobileMenu(false)}/>}
     <aside className={'sidebar glass ' + (mobileMenu ? 'sidebar-open' : '')}>
       <div className="brand">
         <div className="brand-symbol"><Disc3 size={23} strokeWidth={2.1}/></div>
@@ -673,6 +732,61 @@ export default function App() {
               : windowEffectStatus === 'requested' ? nativeMaterial + ' solicitado'
               : 'Ativando vidro…'}
           </span>}
+          <details className="appearance-menu" ref={appearanceRef}>
+            <summary className="appearance-trigger" aria-label="Personalizar aparência"
+              title="Ajustar cores, transparência, densidade e moldura">
+              <SlidersHorizontal size={16}/><span>Personalizar</span>
+            </summary>
+            <div className="appearance-panel" aria-label="Preferências de aparência">
+              <div className="appearance-panel-heading">
+                <strong>Personalizar Thorn</strong>
+                <small>Alterações imediatas e salvas neste dispositivo</small>
+              </div>
+              <label className="appearance-field" htmlFor="thorn-accent">Cor de destaque
+                <select id="thorn-accent" value={accent}
+                  onChange={event => setAccent(event.target.value as AppearanceAccent)}>
+                  <option value="lilac">Lavanda</option>
+                  <option value="mint">Menta</option>
+                  <option value="coral">Coral</option>
+                  <option value="blue">Azul</option>
+                </select>
+              </label>
+              <label className="appearance-field" htmlFor="thorn-density">Densidade
+                <select id="thorn-density" value={density}
+                  onChange={event => setDensity(event.target.value as AppearanceDensity)}>
+                  <option value="comfortable">Confortável</option>
+                  <option value="compact">Compacta</option>
+                </select>
+              </label>
+              <label className="appearance-field" htmlFor="thorn-frame">Moldura interna
+                <select id="thorn-frame" value={frame}
+                  onChange={event => setFrame(event.target.value as AppearanceFrame)}>
+                  <option value="edge">Sem borda extra (padrão)</option>
+                  <option value="framed">Moldura discreta</option>
+                </select>
+              </label>
+              <div className="appearance-field">
+                <div className="appearance-slider-label"><label htmlFor="thorn-glass">Opacidade dos painéis</label>
+                  <output htmlFor="thorn-glass">{glassLevel}%</output></div>
+                <input id="thorn-glass" type="range" min={20} max={85} step={5}
+                  value={glassLevel} disabled={clarityMode}
+                  onChange={event => setGlassLevel(Number(event.target.value))}/>
+                {clarityMode && <small>Desative o modo sólido para ajustar o vidro.</small>}
+              </div>
+              <label className="appearance-check">
+                <input type="checkbox" checked={clarityMode}
+                  onChange={event => setClarityMode(event.target.checked)}/>
+                Painéis sólidos para melhor legibilidade
+              </label>
+              <button type="button" className="appearance-reset"
+                onClick={() => {
+                  setAccent('lilac'); setDensity('comfortable'); setFrame('edge');
+                  setGlassLevel(50); setClarityMode(false); setRailExpanded(false);
+                }}>
+                Restaurar aparência padrão
+              </button>
+            </div>
+          </details>
           <button type="button" className="clarity-toggle"
             aria-pressed={clarityMode}
             aria-label={clarityMode ? 'Ativar painéis translúcidos' : 'Reduzir transparência para facilitar leitura'}
@@ -682,7 +796,7 @@ export default function App() {
           </button>
           <span className="local-pill"><span className="live-dot"/> LOCAL-FIRST</span><button className="top-help" onClick={() => selectSection('optimize')} title="Conheça os controles de segurança" aria-label="Segurança"><CircleHelp size={19}/></button><div className="user-avatar"><Disc3 size={17}/></div></div>
       </header>
-      <main id="main-content" className="content">
+      <main id="main-content" className="content" ref={contentScrollRef}>
         <div className="hero-heading">
           <div><div className="hero-kicker"><Sparkles size={14}/> ARMAZENAMENTO SOB CONTROLE</div><h1>{links.find((link) => link.id === section)?.label}<span className="heading-period">.</span></h1><p>Descubra o que ocupa espaço, identifique desperdícios e tome decisões com segurança.</p></div>
           <div className="scan-controls">
