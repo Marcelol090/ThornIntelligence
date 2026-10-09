@@ -2,6 +2,8 @@ mod allocation;
 mod compare;
 mod health;
 mod index;
+#[cfg(windows)]
+mod ntfs_native;
 mod quarantine;
 mod jobs;
 mod optimize;
