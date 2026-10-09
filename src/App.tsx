@@ -9,8 +9,9 @@ import {
   Gauge, HardDrive, Info, Layers3, LoaderCircle, LockKeyhole, Menu, ArchiveRestore, CloudOff,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, WandSparkles, X,
 } from 'lucide-react';
-import type { IndexStats, IndexedSearch, QuarantinePreview, QuarantineItem, QuarantineAuditReport, CompareReport, CompareRequest, AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
+import type { IndexedScope, IndexStats, IndexedSearch, QuarantinePreview, QuarantineItem, QuarantineAuditReport, CompareReport, CompareRequest, AllocationItem, AllocationReport, AllocationRequest, DiskHealth, DuplicateGroup, FileResult, OptimizationResult, ScanReport, ScanProgress, ScanRequest, SearchRequest, SearchReport, Section } from './types';
 import { bytes, duration, number, truncatePath } from './lib/format';
+import { IndexedTree } from './components/IndexedTree';
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
 const links: { id: Section; label: string; icon: IconType }[] = [
@@ -126,6 +127,10 @@ export default function App() {
   const [indexPaused, setIndexPaused] = useState(false);
   const [indexPausePending, setIndexPausePending] = useState(false);
   const [indexStats, setIndexStats] = useState<IndexStats | null>(null);
+  const [indexedScopes, setIndexedScopes] = useState<IndexedScope[]>([]);
+  const [selectedIndexedRoot, setSelectedIndexedRoot] = useState('');
+  const [indexedScopesLoading, setIndexedScopesLoading] = useState(false);
+  const [treeRevision, setTreeRevision] = useState(0);
   const [useCachedIndex, setUseCachedIndex] = useState(false);
   const [cachedAt, setCachedAt] = useState<number | null>(null);
   const [quarantinePath, setQuarantinePath] = useState('');
@@ -222,6 +227,7 @@ export default function App() {
       };
       const result = await invoke<ScanReport>('scan_path', { request, jobId, onProgress });
       setReport(result);
+      setSelectedIndexedRoot(result.root);
       setSearchResult(null);
       setAllocationReport(null);
       setToast('Análise concluída em ' + duration(result.elapsedMs) + '.');
@@ -403,8 +409,25 @@ export default function App() {
     }
   }
 
-  async function refreshIndex() {
-    if (!report || activeJob.current || busy || searchBusy || indexBusy) return;
+  async function loadIndexedScopes() {
+    setIndexedScopesLoading(true);
+    try {
+      const scopes = await invoke<IndexedScope[]>('list_indexed_scopes');
+      setIndexedScopes(scopes);
+      setSelectedIndexedRoot(previous =>
+        previous && scopes.some(item => item.root === previous) ? previous
+          : report?.root || scopes[0]?.root || ''
+      );
+    } catch (err) {
+      setError('Não foi possível listar os índices locais: ' + String(err));
+    } finally {
+      setIndexedScopesLoading(false);
+    }
+  }
+
+  async function refreshIndex(targetRoot?: string) {
+    const root = targetRoot || selectedIndexedRoot || report?.root || '';
+    if (!root || activeJob.current || busy || searchBusy || indexBusy) return;
     setError('');
     const jobId = crypto.randomUUID();
     const onProgress = new Channel<ScanProgress>();
@@ -423,11 +446,19 @@ export default function App() {
     setIndexBusy(true);
     try {
       const stats = await invoke<IndexStats>('refresh_index', {
-        root: report.root, jobId, onProgress,
+        root, jobId, onProgress,
       });
       setIndexStats(stats);
+      setSelectedIndexedRoot(stats.root);
+      // completedAtUnix has only second resolution; use an explicit nonce.
+      setTreeRevision(current => current + 1);
+      await loadIndexedScopes();
       setUseCachedIndex(true);
-      setToast('Índice atualizado: ' + number(stats.added) + ' novos, ' +
+      const mode = stats.indexMethod === 'ntfs_mft' ? 'NTFS/MFT verificada' :
+        stats.indexMethod === 'usn_unchanged' ? 'USN sem mudanças — sem reenumeração' :
+        stats.indexMethod === 'usn_delta' ? 'USN incremental — metadados existentes' :
+        'WalkDir (fallback seguro)';
+      setToast('Índice: ' + mode + ' · ' + number(stats.added) + ' novos, ' +
         number(stats.changed) + ' alterados, ' + number(stats.unchanged) + ' inalterados.');
     } catch (err) {
       const message = String(err);
@@ -563,6 +594,7 @@ export default function App() {
     setError('');
     setMobileMenu(false);
     if (value === 'cleanup') void loadQuarantine();
+    if (value === 'explorer') void loadIndexedScopes();
   }
 
   const scanned = report !== null;
@@ -670,7 +702,7 @@ export default function App() {
         {report && (report.truncated || report.errors > 0 || !report.duplicateAnalysisComplete || report.hardlinkAliases > 0 || report.skippedContentFiles > 0) && <div className="alert warning-alert"><Info size={18}/><span>{report.truncated ? 'Amostragem solicitada: limite explícito de arquivos atingido; o relatório é parcial. ' : ''}{report.errors > 0 ? number(report.errors) + ' entradas não puderam ser processadas. ' : ''}{report.hashingSkipped ? 'Modo rápido: BLAKE3 não executado. Ative a análise para verificar cópias. ' :
             !report.duplicateAnalysisComplete ? 'Análise de duplicados incompleta (limite de leitura ou arquivos indisponíveis); pode haver mais cópias. ' : ''}{report.hardlinkAliases > 0 ? number(report.hardlinkAliases) + ' links físicos compartilhados foram excluídos das estimativas. ' : ''}{report.skippedContentFiles > 0 ? number(report.skippedContentFiles) + ' arquivos de conteúdo remoto/offline ou reparse foram ignorados no hash para evitar downloads involuntários. ' : ''}As estimativas não equivalem a espaço liberado.</span></div>}
 
-        {!scanned && section !== 'optimize' && section !== 'compare' && section !== 'cleanup' && <div className="onboarding glass">
+        {!scanned && section !== 'optimize' && section !== 'compare' && section !== 'cleanup' && section !== 'explorer' && <div className="onboarding glass">
           <div className="onboarding-content"><Tag tone="blue"><Sparkles size={13}/> INTELLIGENT STORAGE</Tag><h2>Encontre espaço que você nem sabia que tinha.</h2><p>Mapeie arquivos, compare tamanhos, descubra duplicados reais com BLAKE3 e pesquise nomes ou caminhos usando expressões regulares. Tudo acontece no seu computador.</p><button className="primary-button" disabled={busy} onClick={() => void scanFolder()}><FolderOpen size={18}/> Escolher pasta <ArrowRight size={17}/></button></div>
           <div className="onboarding-visual"><div className="orb orb-one"/><div className="orb orb-two"/><div className="preview-card preview-main"><div className="preview-dotline"><i/><i/><i/></div><div className="preview-chart"><div/><div/><div/><div/><div/><div/><div/></div><div className="preview-baseline"/></div><div className="preview-card preview-small"><Fingerprint size={21}/><span>BLAKE3</span><CheckCircle2 size={17}/></div></div>
         </div>}
@@ -711,7 +743,47 @@ export default function App() {
           <section className="panel glass wide-panel"><SectionHeading kicker="OPORTUNIDADES" title="Arquivos que mais ocupam espaço" right={<button className="text-button" onClick={() => selectSection('explorer')}>Explorar arquivos <ArrowRight size={16}/></button>}/><FileRows files={report.topFiles.slice(0, 7)} copy={copy}/></section>
         </>}
 
-        {section === 'explorer' && report && <section className="panel glass full-panel">
+        {section === 'explorer' && <section className="panel glass full-panel">
+          <SectionHeading kicker="NAVEGAÇÃO PERSISTENTE" title="Árvore de pesquisa SQLite"
+            description="Abra índices já salvos, mesmo depois de reiniciar o aplicativo. Não é necessário analisar todos os arquivos novamente."/>
+          <div className="indexed-scopes-controls">
+            <label className="field">
+              <span>Escopo indexado</span>
+              <select aria-label="Escolher escopo indexado"
+                disabled={indexedScopesLoading || indexBusy}
+                value={selectedIndexedRoot || report?.root || ''}
+                onChange={event => setSelectedIndexedRoot(event.target.value)}>
+                {!selectedIndexedRoot && !report && <option value="">Escolha um índice salvo</option>}
+                {(selectedIndexedRoot || report?.root) &&
+                 !indexedScopes.some(item => item.root === (selectedIndexedRoot || report?.root)) &&
+                  <option value={selectedIndexedRoot || report?.root || ''}>
+                    {truncatePath(selectedIndexedRoot || report?.root || '', 90)} — requer indexação
+                  </option>}
+                {indexedScopes.map(item =>
+                  <option key={item.root} value={item.root}>
+                    {truncatePath(item.root, 90)} · {number(item.files)} arquivos
+                    {item.hasTree ? '' : ' · atualizar para ativar árvore'}
+                  </option>)}
+              </select>
+            </label>
+            <button type="button" className="outline-button"
+              disabled={indexedScopesLoading} onClick={() => void loadIndexedScopes()}>
+              {indexedScopesLoading ? 'Consultando…' : 'Recarregar índices'}
+            </button>
+          </div>
+          {(selectedIndexedRoot || report?.root) ?
+            <IndexedTree root={selectedIndexedRoot || report?.root || ''}
+              revision={treeRevision}
+              refreshing={indexBusy}
+              onRefresh={() => void refreshIndex(selectedIndexedRoot || report?.root)}
+              onCopy={(path) => void copy(path)}/>
+            : <p className="panel-note">Nenhum índice publicado. Faça uma análise de pasta e use
+                Atualizar índice SQLite na busca para criar um snapshot persistente.</p>}
+        </section>}
+
+        {section === 'explorer' && report &&
+         (!selectedIndexedRoot || selectedIndexedRoot === report.root) &&
+         <section className="panel glass full-panel">
           <SectionHeading kicker="RANKING POR TAMANHO" title="Arquivos grandes"
             description="Os 300 maiores arquivos encontrados, com identificação de conteúdo offline e redirecionamentos feita apenas pelos metadados."
             right={<div className="allocation-actions">
