@@ -12,7 +12,7 @@ use allocation::{AllocationReport, AllocationRequest};
 use compare::{CompareReport, CompareRequest};
 use health::DiskHealth;
 use index::{IndexStats, IndexedSearch};
-use quarantine::{QuarantineGate, QuarantineItem, QuarantinePreview};
+use quarantine::{QuarantineAuditReport, QuarantineGate, QuarantineItem, QuarantinePreview};
 use jobs::ScanJobs;
 use optimize::OptimizationResult;
 use scan::{ScanProgress, ScanReport, ScanRequest};
@@ -182,6 +182,13 @@ async fn list_quarantine(app: AppHandle) -> Result<Vec<QuarantineItem>, String> 
 }
 
 #[tauri::command]
+async fn audit_quarantine(app: AppHandle) -> Result<QuarantineAuditReport, String> {
+    let app_data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || quarantine::audit(&app_data))
+        .await.map_err(|e| format!("Falha na auditoria da quarentena: {e}"))?
+}
+
+#[tauri::command]
 async fn restore_quarantine(
     id: String, confirmation: String, app: AppHandle,
 ) -> Result<QuarantineItem, String> {
@@ -219,7 +226,7 @@ pub fn run() {
         .manage(Arc::new(QuarantineGate::default()))
         .invoke_handler(tauri::generate_handler![scan_path, search_path, compare_folders, measure_allocated_sizes, cancel_scan,
             pause_index, resume_index, refresh_index, search_index,
-            preview_quarantine, quarantine_file, list_quarantine, restore_quarantine,
+            preview_quarantine, quarantine_file, list_quarantine, audit_quarantine, restore_quarantine,
             optimize_volume, disk_health])
         .run(tauri::generate_context!())
         .expect("error while running Thorn Intelligence");

@@ -211,3 +211,25 @@ O comando Atualizar índice SQLite agora permite todas as entradas acessíveis s
 ### Pausar e retomar a indexação sem perder a operação ativa
 
 Durante Atualizar índice SQLite, use **Pausar** para interromper a enumeração entre entradas; o contador permanece visível e a tarefa conserva a sessão ativa. Use **Retomar** para continuar a partir do mesmo iterador, sem começar novamente, enquanto o aplicativo continuar aberto. **Cancelar** também funciona durante a pausa: o token de cancelamento acorda o indexador e impede publicar dados incompletos. Só a geração final, totalmente varrida, aparece nas pesquisas. O sistema consulta o token a cada entrada, com atraso de até aproximadamente 50 ms entre verificações (chamadas de disco bloqueadas podem demorar mais). Não é um recurso de retomada após desligamento/reinício: os metadados podem mudar enquanto a máquina está offline e o índice será reenumerado em uma nova tentativa. Consulte docs/ARCHITECTURE.md.
+
+## Auditoria de integridade da quarentena (PR de segurança)
+
+Na seção **Quarentena segura → Integridade da quarentena**, a ação **Auditar agora** compara o manifesto SQLite com os nomes/tamanhos dos arquivos existentes no diretório gerenciado pelo Thorn. A operação é estritamente **somente leitura** para o manifesto e para os arquivos: não move, não restaura, não exclui e não lê conteúdos de arquivos. Nenhuma ação automática é tomada diante de inconsistências.
+
+- **Movimento pendente:** entrada `prepared` indica uma intenção persistida, que pode ter ficado incompleta antes ou depois da movimentação.
+- **Arquivo ausente:** uma entrada `quarantined` não possui arquivo no diretório gerenciado.
+- **Arquivo divergente:** tipo, reparse/symlink ou tamanho não correspondem ao manifesto (isso **não** é verificação por conteúdo/hash).
+- **Arquivo sem manifesto:** uma entrada física não está entre os IDs confiáveis do banco. Não é restaurada automaticamente.
+- **Estado inesperado:** uma entrada marcada `restored` ou `failed` ainda possui arquivo gerenciado.
+
+A auditoria rejeita redirecionamento do diretório raiz, valida UUIDs do manifesto e limita a consulta a 5.000 registros e 5.000 entradas de diretório. Os relatórios parciais são claramente identificados e não classificam IDs ainda não verificados como órfãos. Somente as primeiras 50 divergências são exibidas na UI; o total consultado permanece indicado. Como a verificação pode sofrer mudanças concorrentes no filesystem, o resultado descreve o momento da auditoria e não prova a possibilidade de restauração.
+
+**Referências verificadas com Exa:** [SQLite atomic commit](https://www.sqlite.org/atomiccommit.html), [SQLite database recovery behavior](https://www.sqlite.org/howtocorrupt.html), [Microsoft SetFileInformationByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle). A atomicidade SQLite **não** torna atômica uma operação que também movimenta arquivos no Windows.
+
+**Testes adicionados, ainda não homologados no Windows:** entradas `prepared`, ausentes, divergentes e órfãs; limite de auditoria sem falsos órfãos; diretório vazio sem criação de banco. A função atual de movimento por caminhos `MoveFileExW` continua sujeita a riscos residuais TOCTOU em ambientes hostis, logo esta feature não equivale a aprovação para uso da quarentena em produção.
+
+## Feedback correto do escopo durante a varredura
+
+A faixa **Escopo atual** agora mostra imediatamente a pasta efetivamente selecionada enquanto o scanner está trabalhando, com estado `ANALISANDO`, mesmo antes de existir um `ScanReport`. O estado `activeScanRoot` é separado de `report.root`: cancelar ou falhar a operação restaura automaticamente a indicação do último relatório concluído, sem apagar os dados anteriores. Não é exibida uma porcentagem inventada durante enumerações sem total conhecido.
+
+A motivação foi a captura da interface com `51.971 arquivos processados` mas `Nenhuma pasta selecionada`. Pesquisa prévia Exa sobre feedback de scanners: [rdirstat](https://github.com/AndyGybels/rdirstat), [ZDirMap](https://github.com/TheHolyOneZ/ZDirMap) e [WizTree changelog](https://diskanalyzer.com/download). Testar no Windows: iniciar escopo novo, cancelar com e sem relatório anterior e terminar com sucesso.

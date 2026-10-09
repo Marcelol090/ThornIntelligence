@@ -291,6 +291,177 @@ pub fn list(app_data: &Path) -> Result<Vec<QuarantineItem>, String> {
     Ok(result)
 }
 
+
+const MAX_AUDIT_ROWS: usize = 5_000;
+const MAX_AUDIT_FILES: usize = 5_000;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineAuditIssue {
+    pub id: String,
+    pub original_path: Option<String>,
+    pub kind: String,
+    pub details: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineAuditReport {
+    pub checked_entries: usize,
+    pub checked_files: usize,
+    pub missing_files: usize,
+    pub orphan_files: usize,
+    pub pending_entries: usize,
+    pub unexpected_files: usize,
+    pub changed_files: usize,
+    pub truncated: bool,
+    pub issues: Vec<QuarantineAuditIssue>,
+}
+
+fn rejected_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() { return true; }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 { return true; }
+    }
+    false
+}
+
+/// Audit the SQLite intent journal against the managed files. Never opens
+/// file contents, writes metadata, restores files or deletes anything.
+fn audit_with_limits(
+    app_data: &Path,
+    max_rows: usize,
+    max_files: usize,
+) -> Result<QuarantineAuditReport, String> {
+    use rusqlite::OpenFlags;
+    use std::collections::HashSet;
+
+    let root = app_data.join("quarantine");
+    let root_exists = match std::fs::symlink_metadata(&root) {
+        Ok(meta) if meta.is_dir() && !rejected_reparse(&meta) => true,
+        Ok(_) => return Err("Quarentena redirecionada ou inválida: auditoria bloqueada.".into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(format!("Não foi possível inspecionar a quarentena: {err}")),
+    };
+    let mut report = QuarantineAuditReport {
+        checked_entries: 0, checked_files: 0, missing_files: 0, orphan_files: 0,
+        pending_entries: 0, unexpected_files: 0, changed_files: 0,
+        truncated: false, issues: Vec::new(),
+    };
+    let mut known = HashSet::<String>::new();
+    let db_path = app_data.join("storage-index.sqlite");
+    if db_path.exists() {
+        // Unlike the mutation flow, never initialize schemas or set WAL pragmas.
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path, OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ).map_err(|e| format!("Não foi possível abrir o manifesto em leitura: {e}"))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| format!("Manifesto ocupado: {e}"))?;
+        let has_manifest: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='quarantine_entries')",
+            [], |row| row.get(0),
+        ).map_err(|e| format!("Manifesto não pôde ser consultado: {e}"))?;
+        if has_manifest {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM quarantine_entries", [], |row| row.get(0),
+            ).map_err(|e| format!("Falha ao contar registros: {e}"))?;
+            report.truncated = count > i64::try_from(max_rows).unwrap_or(i64::MAX);
+            let mut stmt = conn.prepare(
+                "SELECT id,original_path,size_bytes,state
+                 FROM quarantine_entries ORDER BY rowid ASC LIMIT ?1",
+            ).map_err(|e| format!("Falha ao consultar registros: {e}"))?;
+            let mut rows = stmt.query(params![i64::try_from(max_rows).unwrap_or(i64::MAX)])
+                .map_err(|e| format!("Falha ao percorrer registros: {e}"))?;
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                let id: String = row.get(0).map_err(|e| e.to_string())?;
+                let original: String = row.get(1).map_err(|e| e.to_string())?;
+                let expected: i64 = row.get(2).map_err(|e| e.to_string())?;
+                let state: String = row.get(3).map_err(|e| e.to_string())?;
+                report.checked_entries += 1;
+                // Local SQLite data must not turn into path traversal.
+                if Uuid::parse_str(&id).ok().map_or(true, |uuid| uuid.to_string() != id) {
+                    report.unexpected_files += 1;
+                    report.issues.push(QuarantineAuditIssue {
+                        id: id.chars().take(120).collect(), original_path: None,
+                        kind: "invalid_id".into(),
+                        details: "ID de manifesto inválido; nenhuma ação automática.".into(),
+                    });
+                    continue;
+                }
+                known.insert(id.clone());
+                let target = root.join(&id);
+                let actual = if root_exists {
+                    match std::fs::symlink_metadata(&target) {
+                        Ok(metadata) => Some(metadata),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(err) => return Err(format!("Falha de metadados na quarentena: {err}")),
+                    }
+                } else { None };
+
+                let (kind, details) = match (state.as_str(), actual) {
+                    ("prepared", Some(_)) => {
+                        report.pending_entries += 1;
+                        ("pending", "Movimentação iniciada e não confirmada no manifesto. Revisar antes de restaurar.")
+                    }
+                    ("prepared", None) => {
+                        report.pending_entries += 1;
+                        ("pending", "Intenção registrada, porém o arquivo não foi localizado na quarentena.")
+                    }
+                    ("quarantined", None) => {
+                        report.missing_files += 1;
+                        ("missing", "Registro ativo sem arquivo gerenciado. Não assumir que pode ser restaurado.")
+                    }
+                    ("quarantined", Some(meta)) if !meta.is_file()
+                        || rejected_reparse(&meta)
+                        || expected < 0 || meta.len() != expected as u64 => {
+                        report.changed_files += 1;
+                        ("changed", "Arquivo alterado, com tamanho divergente ou link não confiável.")
+                    }
+                    ("restored" | "failed", Some(_)) => {
+                        report.unexpected_files += 1;
+                        ("unexpected", "Arquivo permanece na quarentena apesar do estado do manifesto.")
+                    }
+                    _ => continue,
+                };
+                report.issues.push(QuarantineAuditIssue {
+                    id, original_path: Some(original), kind: kind.into(), details: details.into(),
+                });
+            }
+        }
+    }
+
+    // A truncated manifest cannot distinguish unvisited IDs from orphans.
+    if root_exists && !report.truncated {
+        let dir = std::fs::read_dir(&root)
+            .map_err(|e| format!("Não foi possível listar a quarentena: {e}"))?;
+        for entry in dir {
+            let entry = entry.map_err(|e| format!("Falha ao enumerar quarentena: {e}"))?;
+            if report.checked_files >= max_files {
+                report.truncated = true;
+                break;
+            }
+            report.checked_files += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !known.contains(&name) {
+                report.orphan_files += 1;
+                report.issues.push(QuarantineAuditIssue {
+                    id: name.chars().take(120).collect(), original_path: None,
+                    kind: "orphan".into(),
+                    details: "Entrada gerenciada sem manifesto; não existe restauração automática.".into(),
+                });
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Pure audit: no path mutation, no content read, no implicit recovery.
+pub fn audit(app_data: &Path) -> Result<QuarantineAuditReport, String> {
+    audit_with_limits(app_data, MAX_AUDIT_ROWS, MAX_AUDIT_FILES)
+}
+
 pub fn restore(id: String, confirmation: String, app_data: &Path)
     -> Result<QuarantineItem, String> {
     if confirmation != CONFIRM_RESTORE { return Err("Digite RESTAURAR para confirmar.".into()); }
@@ -387,6 +558,79 @@ mod tests {
         assert_eq!(restored.status, "restored");
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "recover me");
         assert!(list(app.path()).unwrap().is_empty());
+    }
+
+
+    #[test]
+    fn audit_detects_pending_missing_orphan_and_changed_without_file_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("quarantine");
+        std::fs::create_dir_all(&root).unwrap();
+        let conn = db(dir.path()).unwrap();
+        let pending = Uuid::new_v4().to_string();
+        let missing = Uuid::new_v4().to_string();
+        let changed = Uuid::new_v4().to_string();
+        for (id, status, size) in [
+            (&pending, "prepared", 3), (&missing, "quarantined", 3),
+            (&changed, "quarantined", 40),
+        ] {
+            conn.execute(
+                "INSERT INTO quarantine_entries
+                 (id,original_path,size_bytes,modified_ns,identity_hex,created_at_unix,state)
+                 VALUES (?1,'C:\\test.bin',?2,0,'1',0,?3)",
+                params![id, size, status],
+            ).unwrap();
+        }
+        let orphan = Uuid::new_v4().to_string();
+        std::fs::write(root.join(&pending), b"abc").unwrap();
+        std::fs::write(root.join(&changed), b"abc").unwrap();
+        std::fs::write(root.join(&orphan), b"untracked").unwrap();
+        let before = std::fs::read(root.join(&orphan)).unwrap();
+        let report = audit(dir.path()).unwrap();
+        assert!(!report.truncated);
+        assert_eq!(report.checked_entries, 3);
+        assert_eq!(report.checked_files, 3);
+        assert_eq!(report.pending_entries, 1);
+        assert_eq!(report.missing_files, 1);
+        assert_eq!(report.changed_files, 1);
+        assert_eq!(report.orphan_files, 1);
+        assert_eq!(report.issues.len(), 4);
+        assert_eq!(std::fs::read(root.join(&orphan)).unwrap(), before);
+        assert!(root.join(&pending).exists());
+        assert!(root.join(&changed).exists());
+    }
+
+    #[test]
+    fn audit_limit_never_misclassifies_unvisited_manifest_entries_as_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("quarantine");
+        std::fs::create_dir_all(&root).unwrap();
+        let conn = db(dir.path()).unwrap();
+        for _ in 0..3 {
+            let id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO quarantine_entries
+                 (id,original_path,size_bytes,modified_ns,identity_hex,created_at_unix,state)
+                 VALUES (?1,'C:\\file',1,0,'1',0,'quarantined')",
+                params![id],
+            ).unwrap();
+            std::fs::write(root.join(&id), b"x").unwrap();
+        }
+        let report = audit_with_limits(dir.path(), 1, 100).unwrap();
+        assert!(report.truncated);
+        assert_eq!(report.checked_entries, 1);
+        assert_eq!(report.checked_files, 0);
+        assert_eq!(report.orphan_files, 0);
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn audit_empty_directory_does_not_create_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = audit(dir.path()).unwrap();
+        assert_eq!(report.checked_entries, 0);
+        assert!(report.issues.is_empty());
+        assert!(!dir.path().join("storage-index.sqlite").exists());
     }
 
     #[test]
