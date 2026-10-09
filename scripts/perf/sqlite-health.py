@@ -4,6 +4,7 @@
 Never VACUUM the user's database; backup then optimize an expendable copy.
 """
 import argparse
+from contextlib import closing
 import json
 import pathlib
 import sqlite3
@@ -30,7 +31,7 @@ def inspect(db_path, simulate_vacuum=False, quick_check=False):
     if not db_path.is_file():
         raise ValueError("SQLite database must be a regular file")
     uri = db_path.as_uri() + "?mode=ro"
-    with sqlite3.connect(uri, uri=True, timeout=10) as source:
+    with closing(sqlite3.connect(uri, uri=True, timeout=10)) as source:
         result = {"schema": 1, "database": str(db_path),
                   "file_size_bytes": db_path.stat().st_size,
                   "before": health(source)}
@@ -39,7 +40,7 @@ def inspect(db_path, simulate_vacuum=False, quick_check=False):
         if simulate_vacuum:
             with tempfile.TemporaryDirectory(prefix="thorn-sqlite-scratch-") as folder:
                 scratch = pathlib.Path(folder) / "snapshot.sqlite"
-                with sqlite3.connect(scratch) as target:
+                with closing(sqlite3.connect(scratch)) as target:
                     # Includes committed WAL changes via SQLite snapshot/backup API.
                     start = time.perf_counter()
                     source.backup(target)
