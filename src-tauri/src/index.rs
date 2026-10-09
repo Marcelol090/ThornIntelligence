@@ -255,6 +255,41 @@ fn wait_indexer(
     Ok(())
 }
 
+#[cfg(windows)]
+fn cached_ntfs_snapshot(db_path: &Path, root: &Path) -> Option<(usize,i64)> {
+    use rusqlite::OpenFlags;
+    if !db_path.is_file() {return None;}
+    // No schema creation, DELETE or WAL PRAGMA before the USN query. This
+    // prevents our own database writes from invalidating the shortcut.
+    let conn=Connection::open_with_flags(db_path,OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.busy_timeout(Duration::from_secs(3)).ok()?;
+    let root_name=root.to_string_lossy().into_owned();
+    let (generation,file_count,completed): (i64,i64,i64)=conn.query_row(
+        "SELECT generation,file_count,completed_at_unix
+         FROM indexed_scopes WHERE root=?1",
+        params![root_name],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional().ok()??;
+    let tree:bool=conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM indexed_directories
+         WHERE root=?1 AND path=?1 AND generation=?2)",
+        params![root_name,generation],|r|r.get(0),
+    ).ok()?;
+    if !tree || file_count<0 {return None;}
+    let (id,usn,serial,root_id): (String,i64,i64,String)=conn.query_row(
+        "SELECT journal_id,from_usn,volume_serial,root_file_id
+         FROM indexed_ntfs_checkpoint WHERE root=?1",
+        params![root_name],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional().ok()??;
+    if serial<0 || serial>u32::MAX as i64 || usn<0 {return None;}
+    let previous=crate::ntfs_native::Cursor {
+        journal_id:u64::from_str_radix(&id,16).ok()?,
+        first_usn:0,next_usn:usn,volume_serial:serial as u32,
+        root_file_id:u64::from_str_radix(&root_id,16).ok()?,
+    };
+    if crate::ntfs_native::unchanged_since(root,previous)!=Ok(true) {return None;}
+    Some((usize::try_from(file_count).ok()?,completed))
+}
+
 /// Incrementally inventory metadata into bounded, durable SQLite WAL batches.
 /// Readers continue to see the previous completed snapshot throughout traversal.
 /// A separate, atomic publication transaction updates live rows only after every
@@ -293,12 +328,27 @@ fn refresh_inner(
     let root = std::fs::canonicalize(requested_root)
         .map_err(|e| format!("Pasta não encontrada: {e}"))?;
     let root_str = root.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    if allow_native && max_files.is_none()
+        && !cancel.load(Ordering::Relaxed) && !paused.load(Ordering::Relaxed) {
+        if let Some((file_count,completed))=cached_ntfs_snapshot(db_path,&root) {
+            progress(ScanProgress {
+                phase:"complete".into(),files_scanned:file_count,hash_bytes_read:0,
+            });
+            return Ok(IndexStats {
+                root:root_str,files:file_count,added:0,changed:0,
+                unchanged:file_count,removed:0,skipped_directories:0,
+                completed_at_unix:completed,elapsed_ms:timer.elapsed().as_millis(),
+                batches_written:0,index_method:"usn_unchanged".into(),
+            });
+        }
+    }
     let mut conn = connection(db_path)?;
 
     // The previous snapshot is never modified until final publication.
-    // Cleanup of a canceled staging generation is safe and isolated by root.
-    conn.execute("DELETE FROM indexed_stage WHERE root=?1", params![root_str])
-        .map_err(db_err)?;
+    // Do not touch staging before testing the USN shortcut. That DELETE
+    // itself may generate USN events on the same volume and force a false
+    // "changes detected" result on every refresh.
     let old_generation: i64 = conn.query_row(
         "SELECT generation FROM indexed_scopes WHERE root = ?1",
         params![root_str], |row| row.get(0),
@@ -306,56 +356,14 @@ fn refresh_inner(
     let generation = old_generation.checked_add(1)
         .ok_or("Contador de gerações do índice esgotado.")?;
 
-    // Guarded USN fast-path. Never trust a journal that wrapped/reset, nor a
-    // legacy snapshot without a materialized directory tree.
+    // This watermark precedes both native and fallback enumeration. On the
+    // next refresh, changes during staging are included in the USN interval.
     #[cfg(windows)]
     let before_scan = crate::ntfs_native::cursor(&root).ok();
-    #[cfg(windows)]
-    if allow_native && max_files.is_none() && !cancel.load(Ordering::Relaxed)
-        && !paused.load(Ordering::Relaxed) && old_generation != 0 {
-        let checkpoint: Option<(String,i64,i64,String)> = conn.query_row(
-            "SELECT journal_id,from_usn,volume_serial,root_file_id
-             FROM indexed_ntfs_checkpoint WHERE root=?1",
-            params![root_str], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
-        ).optional().map_err(db_err)?;
-        let published_tree: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM indexed_directories
-             WHERE root=?1 AND path=?1 AND generation=?2)",
-            params![root_str,old_generation], |r|r.get(0),
-        ).map_err(db_err)?;
-        if published_tree {
-            if let (Some((id,cursor,serial,root_id)),Some(_))=(checkpoint,before_scan) {
-                if let (Ok(old_id),Ok(file_id))=(
-                    u64::from_str_radix(&id,16),
-                    u64::from_str_radix(&root_id,16),
-                ) {
-                    let previous=crate::ntfs_native::Cursor {
-                        journal_id:old_id,first_usn:0,next_usn:cursor,
-                        volume_serial:serial as u32,root_file_id:file_id,
-                    };
-                    if serial>=0 && serial<=u32::MAX as i64
-                        && crate::ntfs_native::unchanged_since(&root,previous)==Ok(true) {
-                        let (count,completed): (i64,i64)=conn.query_row(
-                            "SELECT file_count,completed_at_unix FROM indexed_scopes WHERE root=?1",
-                            params![root_str],|r| Ok((r.get(0)?,r.get(1)?)),
-                        ).map_err(db_err)?;
-                        progress(ScanProgress {
-                            phase:"complete".into(),files_scanned:count.max(0) as usize,
-                            hash_bytes_read:0,
-                        });
-                        return Ok(IndexStats {
-                            root:root_str,files:count.max(0) as usize,
-                            added:0,changed:0,unchanged:count.max(0) as usize,
-                            removed:0,skipped_directories:0,
-                            completed_at_unix:completed,
-                            elapsed_ms:timer.elapsed().as_millis(),
-                            batches_written:0,index_method:"usn_unchanged".into(),
-                        });
-                    }
-                }
-            }
-        }
-    }
+    // Discard aborted staging only for real enumeration, never for the
+    // no-change shortcut. Unpublished generations are never queryable.
+    conn.execute("DELETE FROM indexed_stage WHERE root=?1", params![root_str])
+        .map_err(db_err)?;
     // Native candidate paths are allowed only after checking the root FRN,
     // hardlink counts and static journal. On any failure, fall back to WalkDir.
     #[cfg(windows)]
