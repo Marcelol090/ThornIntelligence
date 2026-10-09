@@ -442,7 +442,10 @@ export default function App() {
       setTreeRevision(current => current + 1);
       await loadIndexedScopes();
       setUseCachedIndex(true);
-      setToast('Índice atualizado: ' + number(stats.added) + ' novos, ' +
+      const mode = stats.indexMethod === 'ntfs_mft' ? 'NTFS/MFT verificada' :
+        stats.indexMethod === 'usn_unchanged' ? 'USN sem mudanças — sem reenumeração' :
+        'WalkDir (fallback seguro)';
+      setToast('Índice: ' + mode + ' · ' + number(stats.added) + ' novos, ' +
         number(stats.changed) + ' alterados, ' + number(stats.unchanged) + ' inalterados.');
     } catch (err) {
       const message = String(err);

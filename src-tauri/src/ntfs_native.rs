@@ -192,17 +192,28 @@ fn journal(handle:&Handle)->Result<JournalDataV0,String> {
     })
 }
 #[derive(Debug,Clone,Copy)]
-pub struct Cursor { pub journal_id:u64,pub first_usn:i64,pub next_usn:i64 }
+pub struct Cursor {
+    pub journal_id:u64,pub first_usn:i64,pub next_usn:i64,
+    pub volume_serial:u32,pub root_file_id:u64,
+}
 impl Cursor {
     pub fn retains(&self,old:&Self)->bool {
-        self.journal_id==old.journal_id && old.next_usn>=self.first_usn
+        self.journal_id==old.journal_id
+            && self.volume_serial==old.volume_serial
+            && self.root_file_id==old.root_file_id
+            && old.next_usn>=self.first_usn
             && old.next_usn<=self.next_usn && self.first_usn>=0
     }
 }
 pub fn cursor(root:&Path)->Result<Cursor,String> {
     let (handle,_)=open_ntfs_volume(root)?;
     let j=journal(&handle)?;
-    Ok(Cursor {journal_id:j.journal_id,first_usn:j.first_usn.max(j.lowest_valid_usn),next_usn:j.next_usn})
+    let root_info=file_info(root)?;
+    Ok(Cursor {
+        journal_id:j.journal_id,first_usn:j.first_usn.max(j.lowest_valid_usn),
+        next_usn:j.next_usn,volume_serial:root_info.volume_serial,
+        root_file_id:root_info.file_index(),
+    })
 }
 
 /// Check every USN record in (previous watermark, bounded current watermark).
@@ -211,8 +222,10 @@ pub fn cursor(root:&Path)->Result<Cursor,String> {
 pub fn unchanged_since(root:&Path, old:Cursor) -> Result<bool,String> {
     let (handle,_)=open_ntfs_volume(root)?;
     let now=journal(&handle)?;
+    let info=file_info(root)?;
     let current=Cursor {journal_id:now.journal_id,
-        first_usn:now.first_usn.max(now.lowest_valid_usn),next_usn:now.next_usn};
+        first_usn:now.first_usn.max(now.lowest_valid_usn),next_usn:now.next_usn,
+        volume_serial:info.volume_serial,root_file_id:info.file_index()};
     if !current.retains(&old) { return Err("USN journal alterado, truncado ou substituído.".into()); }
     if current.next_usn==old.next_usn { return Ok(true); }
     let mut start=old.next_usn;
@@ -250,10 +263,12 @@ pub struct Enumeration { pub paths:Vec<(PathBuf,bool)>, pub checkpoint:Cursor }
 pub fn enumerate(root:&Path,cancel:&AtomicBool)->Result<Enumeration,String> {
     let (handle,letter)=open_ntfs_volume(root)?;
     let beginning=journal(&handle)?;
+    let root_info=file_info(root)?;
     let checkpoint=Cursor {
         journal_id:beginning.journal_id,
         first_usn:beginning.first_usn.max(beginning.lowest_valid_usn),
         next_usn:beginning.next_usn,
+        volume_serial:root_info.volume_serial,root_file_id:root_info.file_index(),
     };
     let root_disk=PathBuf::from(format!(r"\\?\{letter}:\"));
     let mut next_frn=0u64;
@@ -384,11 +399,17 @@ mod tests {
     use super::*;
     #[test]
     fn journal_watermark_rejects_gaps_and_new_ids() {
-        let old=Cursor{journal_id:7,first_usn:1,next_usn:120};
-        assert!(Cursor{journal_id:7,first_usn:100,next_usn:130}.retains(&old));
-        assert!(!Cursor{journal_id:8,first_usn:100,next_usn:130}.retains(&old));
-        assert!(!Cursor{journal_id:7,first_usn:121,next_usn:130}.retains(&old));
-        assert!(!Cursor{journal_id:7,first_usn:100,next_usn:119}.retains(&old));
+        let old=Cursor{journal_id:7,first_usn:1,next_usn:120,
+            volume_serial:55,root_file_id:500};
+        let changed=|id,first,next,serial,root|Cursor{
+            journal_id:id,first_usn:first,next_usn:next,
+            volume_serial:serial,root_file_id:root};
+        assert!(changed(7,100,130,55,500).retains(&old));
+        assert!(!changed(8,100,130,55,500).retains(&old));
+        assert!(!changed(7,121,130,55,500).retains(&old));
+        assert!(!changed(7,100,119,55,500).retains(&old));
+        assert!(!changed(7,100,130,56,500).retains(&old));
+        assert!(!changed(7,100,130,55,501).retains(&old));
     }
     #[test]
     fn truncated_or_unknown_usn_records_are_rejected() {

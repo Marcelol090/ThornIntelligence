@@ -174,6 +174,8 @@ export interface IndexStats {
   completedAtUnix: number;
   elapsedMs: number;
   batchesWritten: number;
+  /** Native MFT used only after guards; USN no-change or WalkDir fallback. */
+  indexMethod: 'ntfs_mft' | 'usn_unchanged' | 'walkdir';
 }
 export interface IndexedSearch {
   report: SearchReport;

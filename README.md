@@ -237,3 +237,37 @@ O Explorador passa a consultar os **até 100 escopos SQLite publicados mais rece
 A listagem indica índices antigos que precisam ser atualizados para materializar a árvore. O usuário pode indexar novamente pelo botão da própria árvore; nenhuma indexação é disparada automaticamente ao reabrir o programa. Existe teste Rust cobrindo índice ausente (sem criar banco) e uma atualização seguida da recuperação do escopo salvo. O snapshot é histórico e pode estar desatualizado em relação ao disco.
 
 Fontes já pesquisadas por Exa/GitHub: file-index e minidex (índices persistentes), TanStack Virtual e react-arborist (árvores responsivas), AllTheThings e Strata (integração futura de MFT/USN).
+
+## NTFS MFT/USN — caminho nativo conservador (PR #16)
+
+Pesquisa conduzida pelo Exa nas APIs oficiais do Windows e repositórios Rust (links ao final). O Thorn passa a tentar um **fast path nativo em volumes NTFS locais com letra e privilégios suficientes**, mantendo o WalkDir como fallback de confiança. Não solicita elevação, não cria/edita o journal e não abre conteúdo de arquivos.
+
+### Enumeração inicial MFT
+- A aceleração MFT permanece **experimental e explicitamente opt-in**: defina a variável de ambiente `THORN_EXPERIMENTAL_NTFS_MFT=1` antes de iniciar o Thorn no Windows. Sem essa variável o WalkDir permanece padrão (a verificação USN de intervalo sem mudanças continua disponível se houver permissões).
+- A chamada Win32 FSCTL_ENUM_USN_DATA coleta registros USN V2 (FRN, parent FRN, nome e atributos) e reconstrói caminhos sob a raiz selecionada. O acesso nativo limita-se a **2 milhões de registros MFT**; acima disso usa WalkDir para limitar memória.
+- A MFT não expõe necessariamente todos os nomes de hardlinks e não fornece o tamanho de cada arquivo em USN_RECORD_V2. Por isso, o caminho nativo **valida a identidade do arquivo e o número de hardlinks** por handle de metadados, rejeita caminhos redirecionados/cloud-offline e usa symlink_metadata para obter tamanho/mtime/atributos. A árvore completa continua publicada somente na transação SQLite final.
+- Exige raiz FRN e serial de volume consistentes com o caminho canônico. Ambos também são validados nos checkpoints USN para que uma troca de unidade não revalide indevidamente um snapshot antigo. Versionamento inesperado de USN, registros inválidos, permissões insuficientes e alterações no volume durante a enumeração provocam fallback. A publicação MFT é validada novamente após os metadados; se o USN mudar, o staging é descartado e o WalkDir recomeça. **Em um volume C: muito ativo, inclusive quando o próprio SQLite está no C:, é normal a MFT cair no fallback.** Isso preserva correção, mas não garante aceleração mensurável.
+
+### USN Journal como verificação incremental segura
+- Antes do inventário, lê FSCTL_QUERY_USN_JOURNAL e salva **Journal ID e NextUsn inicial**, no mesmo commit da árvore/indexação. O checkpoint inicial, e não o final, garante que mudanças feitas durante a indexação voltem a ser examinadas.
+- Em refresh posterior, se o índice e árvore estiverem completos, o journal tiver a mesma identidade e nenhum intervalo tiver sido descartado, a chamada FSCTL_READ_USN_JOURNAL percorre os eventos do intervalo. **Sem eventos relevantes** (sem alterações ou apenas CLOSE), o Thorn retorna as estatísticas do snapshot publicado e evita a reenumeração inteira.
+- Qualquer evento de criação, modificação, exclusão, rename, alterações complexas, overflow, truncamento, journal reset, record V3 ou erro de acesso **volta ao inventário completo**. Nesta etapa **não** são aplicados deltas de arquivo ao SQLite via FRN: isso exige uma tabela de identidade estável e tratamento transacional de alterações/renames de diretórios. Não confundir o fast path USN sem mudanças com sincronização incremental completa.
+- O relatório informa `indexMethod`: `ntfs_mft`, `usn_unchanged` ou `walkdir`. Os tempos são medidos pelo aplicativo, mas nenhum ganho real foi homologado.
+
+### Validação obrigatória antes de produção
+- Windows 10/11 NTFS com e sem execução elevada; HD/SSD SATA/NVMe; volume C: ativo vs volume secundário; hardlinks reais, junctions e OneDrive offline; journal recriado e USN FirstUsn avançado; diretórios com ACL restrita; pastas enormes e cancelamento durante staging/MFT; diferenças de maiúsculas/Unicode; leitura de endereços DOS/extended.
+- Conferir número de arquivos e diretórios comparando MFT contra WalkDir, e jamais classificar economia de hardlinks de forma duplicada. Comparar bytes lógicos e agregados da árvore após cada refresh. Compilar no Windows com cargo fmt/test/check e testar as duas versões antes de habilitar esta etapa como padrão em releases.
+
+Referências Exa: [Microsoft FSCTL_ENUM_USN_DATA](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_enum_usn_data), [USN record formats](https://learn.microsoft.com/en-us/windows/win32/fileio/walking-a-buffer-of-change-journal-records), [journal ID and cursor safety](https://learn.microsoft.com/en-us/windows/win32/fileio/using-the-change-journal-identifier), [Rust usn-journal-rs](https://github.com/wangfu91/usn-journal-rs), [dowse](https://docs.rs/crate/dowse/latest/source/src/mft.rs). O exemplo do [Bakin's Bits sobre hardlinks](https://bakins-bits.com/2012/06/does-enumerating-files-with-fsctl_enum_usn_data-ever-miss-any-files/) fundamenta a recusa de assumir que FRN equivale a nome de arquivo único.
+
+### Executar um ensaio de MFT no Windows (somente ambiente de teste)
+
+```powershell
+# PowerShell em uma cópia local com arquivos de teste; nunca como limpeza
+$env:THORN_EXPERIMENTAL_NTFS_MFT = "1"
+npm run tauri dev
+# Remova a variável para voltar ao comportamento WalkDir padrão:
+Remove-Item Env:THORN_EXPERIMENTAL_NTFS_MFT
+```
+
+Após **Atualizar índice** confira o método comunicado: `NTFS/MFT verificada` (quando todas as guardas passarem), `USN sem mudanças — sem reenumeração`, ou `WalkDir (fallback seguro)`. A recusa de usar MFT em um volume muito ativo, com hardlinks ou com OneDrive offline é deliberada. Este código não implementa ainda deltas USN complexos de arquivos modificados/renomeados, nem promete velocidades comparáveis a WizTree. Sem testes Windows conclusivos, não o habilite como padrão de produção.

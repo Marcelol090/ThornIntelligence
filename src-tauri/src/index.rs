@@ -22,6 +22,8 @@ pub struct IndexStats {
     pub completed_at_unix: i64,
     pub elapsed_ms: u128,
     pub batches_written: usize,
+    /// Actual strategy, not an unverified speed claim.
+    pub index_method: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +184,13 @@ pub(crate) fn connection(path: &Path) -> Result<Connection, String> {
           attributes INTEGER NOT NULL,
           PRIMARY KEY(root,path)
         );
+        CREATE TABLE IF NOT EXISTS indexed_ntfs_checkpoint (
+          root TEXT PRIMARY KEY,
+          journal_id TEXT NOT NULL,
+          from_usn INTEGER NOT NULL,
+          volume_serial INTEGER NOT NULL,
+          root_file_id TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS indexed_directories (
           root TEXT NOT NULL,
           path TEXT NOT NULL,
@@ -260,6 +269,18 @@ pub fn refresh(
     paused: &AtomicBool,
     mut progress: impl FnMut(ScanProgress),
 ) -> Result<IndexStats, String> {
+    refresh_inner(db_path, requested_root, max_files, cancel, paused, &mut progress, true)
+}
+
+fn refresh_inner(
+    db_path: &Path,
+    requested_root: &str,
+    max_files: Option<usize>,
+    cancel: &AtomicBool,
+    paused: &AtomicBool,
+    progress: &mut impl FnMut(ScanProgress),
+    allow_native: bool,
+) -> Result<IndexStats, String> {
     let timer = Instant::now();
     if max_files == Some(0) {
         return Err("O limite de amostragem deve ser maior que zero.".into());
@@ -285,6 +306,75 @@ pub fn refresh(
     let generation = old_generation.checked_add(1)
         .ok_or("Contador de gerações do índice esgotado.")?;
 
+    // Guarded USN fast-path. Never trust a journal that wrapped/reset, nor a
+    // legacy snapshot without a materialized directory tree.
+    #[cfg(windows)]
+    let before_scan = crate::ntfs_native::cursor(&root).ok();
+    #[cfg(windows)]
+    if allow_native && max_files.is_none() && !cancel.load(Ordering::Relaxed)
+        && !paused.load(Ordering::Relaxed) && old_generation != 0 {
+        let checkpoint: Option<(String,i64,i64,String)> = conn.query_row(
+            "SELECT journal_id,from_usn,volume_serial,root_file_id
+             FROM indexed_ntfs_checkpoint WHERE root=?1",
+            params![root_str], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
+        ).optional().map_err(db_err)?;
+        let published_tree: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM indexed_directories
+             WHERE root=?1 AND path=?1 AND generation=?2)",
+            params![root_str,old_generation], |r|r.get(0),
+        ).map_err(db_err)?;
+        if published_tree {
+            if let (Some((id,cursor,serial,root_id)),Some(_))=(checkpoint,before_scan) {
+                if let (Ok(old_id),Ok(file_id))=(
+                    u64::from_str_radix(&id,16),
+                    u64::from_str_radix(&root_id,16),
+                ) {
+                    let previous=crate::ntfs_native::Cursor {
+                        journal_id:old_id,first_usn:0,next_usn:cursor,
+                        volume_serial:serial as u32,root_file_id:file_id,
+                    };
+                    if serial>=0 && serial<=u32::MAX as i64
+                        && crate::ntfs_native::unchanged_since(&root,previous)==Ok(true) {
+                        let (count,completed): (i64,i64)=conn.query_row(
+                            "SELECT file_count,completed_at_unix FROM indexed_scopes WHERE root=?1",
+                            params![root_str],|r| Ok((r.get(0)?,r.get(1)?)),
+                        ).map_err(db_err)?;
+                        progress(ScanProgress {
+                            phase:"complete".into(),files_scanned:count.max(0) as usize,
+                            hash_bytes_read:0,
+                        });
+                        return Ok(IndexStats {
+                            root:root_str,files:count.max(0) as usize,
+                            added:0,changed:0,unchanged:count.max(0) as usize,
+                            removed:0,skipped_directories:0,
+                            completed_at_unix:completed,
+                            elapsed_ms:timer.elapsed().as_millis(),
+                            batches_written:0,index_method:"usn_unchanged".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // Native candidate paths are allowed only after checking the root FRN,
+    // hardlink counts and static journal. On any failure, fall back to WalkDir.
+    #[cfg(windows)]
+    let native_data = if allow_native && max_files.is_none()
+        && std::env::var("THORN_EXPERIMENTAL_NTFS_MFT").as_deref()==Ok("1")
+        && !cancel.load(Ordering::Relaxed) {
+        crate::ntfs_native::enumerate(&root,cancel).ok()
+    } else { None };
+    #[cfg(windows)]
+    let native_watermark = native_data.as_ref().map(|data|data.checkpoint);
+    #[cfg(windows)]
+    let native_paths = native_data.map(|data|data.paths);
+    #[cfg(not(windows))]
+    let native_paths: Option<Vec<(PathBuf,bool)>> = None;
+    let mut native_iter = native_paths.map(|paths|paths.into_iter());
+    let used_native = native_iter.is_some();
+    #[cfg(not(windows))]
+    let _ = allow_native;
+
     let mut batch = Vec::<StagedFile>::with_capacity(INDEX_BATCH_SIZE);
     // O(number of distinct directories) memory, not one React node per file.
     // Both empty folders and ancestor totals are retained for tree navigation.
@@ -301,37 +391,56 @@ pub fn refresh(
 
     let mut walker = WalkDir::new(&root).follow_links(false).into_iter();
     loop {
-        wait_indexer(paused, cancel, files, &mut progress)?;
-        let Some(entry) = walker.next() else { break };
-        wait_indexer(paused, cancel, files, &mut progress)?;
-        let entry = entry.map_err(|e| format!("Índice não publicado: entrada inacessível: {e}"))?;
-        if entry.path() == root { continue; }
-        let metadata = std::fs::symlink_metadata(entry.path())
-            .map_err(|e| format!("Índice não publicado: metadados indisponíveis: {e}"))?;
+        wait_indexer(paused, cancel, files, progress)?;
+        let (entry_path,is_dir) = if let Some(ref mut native)=native_iter {
+            let Some((path,is_dir))=native.next() else {break};
+            (path,is_dir)
+        } else {
+            let Some(entry)=walker.next() else {break};
+            let entry=entry.map_err(|e|
+                format!("Índice não publicado: entrada inacessível: {e}"))?;
+            (entry.path().to_path_buf(),entry.file_type().is_dir())
+        };
+        wait_indexer(paused, cancel, files, progress)?;
+        if entry_path == root {continue;}
+        let metadata = match std::fs::symlink_metadata(&entry_path) {
+            Ok(value)=>value,
+            Err(_) if used_native => return refresh_inner(
+                db_path,requested_root,max_files,cancel,paused,progress,false,
+            ),
+            Err(err)=>return Err(format!(
+                "Índice não publicado: metadados indisponíveis: {err}"
+            )),
+        };
+        if used_native && (metadata.is_dir()!=is_dir || is_reparse(&metadata)) {
+            return refresh_inner(
+                db_path,requested_root,max_files,cancel,paused,progress,false,
+            );
+        }
         if is_reparse(&metadata) {
-            if entry.file_type().is_dir() { walker.skip_current_dir(); }
-            skipped_directories += usize::from(entry.file_type().is_dir());
+            if is_dir && !used_native {walker.skip_current_dir();}
+            skipped_directories += usize::from(is_dir);
             continue;
         }
-        if entry.file_type().is_dir() {
-            folder_totals.entry(entry.path().to_path_buf()).or_insert((0,0));
+        if is_dir {
+            folder_totals.entry(entry_path).or_insert((0,0));
             continue;
         }
-        if !entry.file_type().is_file() { continue; }
+        if !metadata.is_file() {continue;}
         // Do not turn an explicit sample into a misleading "complete" index.
         if max_files.is_some_and(|limit| files >= limit) {
             return Err("Amostragem interrompeu a indexação; snapshot anterior preservado.".into());
         }
         // Never index the active SQLite database/WAL/SHM artefacts as they change.
-        if entry.path() == db_path ||
-            entry.path() == PathBuf::from(format!("{}-wal", db_path.display())) ||
-            entry.path() == PathBuf::from(format!("{}-shm", db_path.display())) {
+        if entry_path.as_path() == db_path ||
+            entry_path.as_path() == PathBuf::from(format!("{}-wal", db_path.display())) ||
+            entry_path.as_path() == PathBuf::from(format!("{}-shm", db_path.display())) {
             continue;
         }
-        let path = entry.path().to_string_lossy().into_owned();
-        let parent_path = entry.path().parent().unwrap_or(&root).to_string_lossy().into_owned();
+        let path = entry_path.as_path().to_string_lossy().into_owned();
+        let parent_path = entry_path.as_path().parent().unwrap_or(&root).to_string_lossy().into_owned();
         let size = i64::try_from(metadata.len()).map_err(db_err)?;
-        for ancestor in entry.path().parent().into_iter().flat_map(Path::ancestors) {
+        for ancestor in entry_path.as_path().parent().into_iter().flat_map(Path::ancestors) {
             if !ancestor.starts_with(&root) { break; }
             let total = folder_totals.entry(ancestor.to_path_buf()).or_insert((0,0));
             total.0 = total.0.saturating_add(metadata.len());
@@ -369,7 +478,7 @@ pub fn refresh(
             last_event = Instant::now();
         }
     }
-    wait_indexer(paused, cancel, files, &mut progress)?;
+    wait_indexer(paused, cancel, files, progress)?;
     if !batch.is_empty() {
         flush_stage(&mut conn, &root_str, &mut batch)?;
         batches_written += 1;
@@ -378,10 +487,27 @@ pub fn refresh(
         return Err("Indexação cancelada; snapshot anterior preservado.".into());
     }
 
+    // MFT covers one directory name per FRN and is only valid when the
+    // volume remained still throughout metadata collection. On changes,
+    // discard all staged data and rerun the complete WalkDir implementation.
+    #[cfg(windows)]
+    if used_native {
+        let stable=match (native_watermark,crate::ntfs_native::cursor(&root)) {
+            (Some(before),Ok(after))=> before.journal_id==after.journal_id
+                && before.next_usn==after.next_usn
+                && before.volume_serial==after.volume_serial
+                && before.root_file_id==after.root_file_id,
+            _=>false,
+        };
+        if !stable {
+            return refresh_inner(db_path,requested_root,max_files,cancel,paused,progress,false);
+        }
+    }
+
     // Publication still requires one atomic SQL transaction. For multi-million
     // files this final merge can produce substantial WAL I/O; it does not hold
     // a write transaction during the preceding, potentially hours-long walk.
-    wait_indexer(paused, cancel, files, &mut progress)?;
+    wait_indexer(paused, cancel, files, progress)?;
     let tx = conn.transaction().map_err(db_err)?;
     tx.execute(
         "INSERT INTO indexed_files(root,path,parent_path,size_bytes,modified_ns,attributes,generation)
@@ -422,6 +548,27 @@ pub fn refresh(
             ]).map_err(db_err)?;
         }
     }
+    // The watermark is deliberately captured *before* any enumeration.
+    // If the volume changed mid-walk, the next invocation must recheck.
+    #[cfg(windows)]
+    if let Some(watermark)=before_scan {
+        tx.execute(
+            "INSERT INTO indexed_ntfs_checkpoint
+             (root,journal_id,from_usn,volume_serial,root_file_id)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(root) DO UPDATE SET
+                 journal_id=excluded.journal_id,
+                 from_usn=excluded.from_usn,
+                 volume_serial=excluded.volume_serial,
+                 root_file_id=excluded.root_file_id",
+            params![root_str,format!("{:016x}",watermark.journal_id),
+                watermark.next_usn,i64::from(watermark.volume_serial),
+                format!("{:016x}",watermark.root_file_id)],
+        ).map_err(db_err)?;
+    } else {
+        tx.execute("DELETE FROM indexed_ntfs_checkpoint WHERE root=?1",
+            params![root_str]).map_err(db_err)?;
+    }
     let completed_at_unix = now_unix();
     tx.execute(
         "INSERT INTO indexed_scopes(root,generation,completed_at_unix,file_count)
@@ -443,6 +590,7 @@ pub fn refresh(
         root: root_str, files, added, changed, unchanged, removed,
         skipped_directories, completed_at_unix, elapsed_ms: timer.elapsed().as_millis(),
         batches_written,
+        index_method: if used_native {"ntfs_mft"} else {"walkdir"}.into(),
     })
 }
 
