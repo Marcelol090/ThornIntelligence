@@ -18,7 +18,7 @@ fn setting(name: &str, default: usize, min: usize, max: usize) -> usize {
 }
 
 fn fixture() -> (tempfile::TempDir, PathBuf, usize) {
-    let count = setting("THORN_PERF_FILES", 1_500, 100, 120_000);
+    let count = setting("THORN_PERF_FILES", 1_500, 100, 350_000);
     let temporary = tempfile::tempdir().expect("create private benchmark directory");
     let root = temporary.path().join("scope");
     fs::create_dir(&root).unwrap();
@@ -34,7 +34,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, usize) {
         };
         // 1 in 41 files has identical head/tail but different middle:
         // partial fingerprints must never be used as duplicate proof.
-        let bytes = if i % 41 == 0 {
+        let bytes = if i % 41 == 0 && count <= 120_000 {
             let mut value = vec![0x5Au8; 65_536];
             value[32_768..32_776].copy_from_slice(&(i as u64).to_le_bytes());
             value
