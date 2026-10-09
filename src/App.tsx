@@ -142,11 +142,20 @@ export default function App() {
   const [auditBusy, setAuditBusy] = useState(false);
   const [quarantineAudit, setQuarantineAudit] = useState<QuarantineAuditReport | null>(null);
   const [mobileMenu, setMobileMenu] = useState(false);
+  const [railExpanded, setRailExpanded] = useState(() => {
+    try { return localStorage.getItem('thorn.rail-expanded') === 'true'; }
+    catch { return false; }
+  });
+  const [clarityMode, setClarityMode] = useState(() => {
+    try { return localStorage.getItem('thorn.clarity-mode') === 'true'; }
+    catch { return false; }
+  });
+  const [nativeMaterial, setNativeMaterial] = useState<'Acrylic' | 'Mica'>('Acrylic');
   const [windowEffectStatus, setWindowEffectStatus] = useState<'pending' | 'requested' | 'failed'>('pending');
   const [windowEffectError, setWindowEffectError] = useState('');
 
-  // Acrylic is the visibly translucent Windows 10/11 backdrop; Mica is
-  // a native Windows 11 fallback, not the same as seeing the desktop.
+  // Request ONE backdrop at a time. Tauri applies only the first supported
+  // material; Mica is a fallback if the Acrylic request throws an error.
   // Tauri's window must have transparent:true, and every WebView root
   // layer must be translucent *before* requesting the Windows backdrop.
   useEffect(() => {
@@ -161,11 +170,24 @@ export default function App() {
         const nativeWindow = getCurrentWindow();
         await nativeWindow.setDecorations(true);
         if (!mounted) return;
-        await nativeWindow.setEffects({
-          effects: [Effect.Acrylic, Effect.Mica],
-          state: EffectState.Active,
-        });
-        if (mounted) setWindowEffectStatus('requested');
+        let material: 'Acrylic' | 'Mica' = 'Acrylic';
+        try {
+          await nativeWindow.setEffects({
+            effects: [Effect.Acrylic],
+            state: EffectState.Active,
+          });
+        } catch (acrylicError) {
+          console.warn('[Thorn Intelligence] Acrylic request failed; trying Mica:', acrylicError);
+          material = 'Mica';
+          await nativeWindow.setEffects({
+            effects: [Effect.Mica],
+            state: EffectState.Active,
+          });
+        }
+        if (mounted) {
+          setNativeMaterial(material);
+          setWindowEffectStatus('requested');
+        }
       } catch (err) {
         // Previously swallowed every error, leaving an unexplained solid UI.
         console.warn('[Thorn Intelligence] Native Windows backdrop unavailable:', err);
@@ -182,6 +204,15 @@ export default function App() {
       page.classList.remove('native-vibrancy');
     };
   }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem('thorn.rail-expanded', String(railExpanded)); }
+    catch { /* local-only preference may be unavailable */ }
+  }, [railExpanded]);
+  useEffect(() => {
+    try { localStorage.setItem('thorn.clarity-mode', String(clarityMode)); }
+    catch { /* local-only preference may be unavailable */ }
+  }, [clarityMode]);
 
   async function copy(value: string) {
     try { await navigator.clipboard.writeText(value); setToast('Caminho copiado.'); }
@@ -601,23 +632,29 @@ export default function App() {
   const roots = activeScanRoot ?? report?.root ?? '';
   const scopeName = roots ? (roots.split(/[\\/]/).filter(Boolean).pop() ?? roots) : 'Nenhuma pasta selecionada';
 
-  return <div className="app-shell">
+  return <div className={'app-shell glass-studio' + (railExpanded ? ' rail-expanded' : '') + (clarityMode ? ' clarity-mode' : '')}>
     <aside className={'sidebar glass ' + (mobileMenu ? 'sidebar-open' : '')}>
       <div className="brand">
         <div className="brand-symbol"><Disc3 size={23} strokeWidth={2.1}/></div>
         <div className="brand-words"><strong>THORN<span>INTELLIGENCE</span></strong><small>STORAGE CONSOLE</small></div>
         <button className="mobile-close icon-button" onClick={() => setMobileMenu(false)} aria-label="Fechar menu"><X size={19}/></button>
       </div>
+      <button type="button" className="rail-toggle"
+        aria-label={railExpanded ? 'Recolher barra lateral' : 'Expandir barra lateral'}
+        aria-expanded={railExpanded} title={railExpanded ? 'Recolher menu' : 'Expandir menu'}
+        onClick={() => setRailExpanded(value => !value)}><Menu size={18}/></button>
       <div className="side-group-label">WORKSPACE</div>
       <nav className="nav-menu" aria-label="Navegação principal">
-        {links.map(({ id, icon: Icon, label }) => <button type="button" key={id} className={'nav-link ' + (section === id ? 'selected' : '')} onClick={() => selectSection(id)} aria-current={section === id ? 'page' : undefined}>
-          <Icon size={19}/><span>{label}</span>{section === id && <span className="nav-indicator"/>}
+        {links.map(({ id, icon: Icon, label }) => <button type="button" key={id}
+          className={'nav-link ' + (section === id ? 'selected' : '')} onClick={() => selectSection(id)}
+          aria-label={label} title={label} aria-current={section === id ? 'page' : undefined}>
+          <Icon size={19}/><span className="nav-label">{label}</span>{section === id && <span className="nav-indicator"/>}
         </button>)}
       </nav>
       <div className="sidebar-spacer"/>
       <div className="side-device glass-inset"><div className="device-avatar"><HardDrive size={19}/></div><div><strong>Processamento local</strong><small>Nenhum upload de arquivos</small></div><CheckCircle2 size={17} className="success-icon"/></div>
       <div className="side-help"><ShieldCheck size={16}/> Leitura e diagnóstico seguros</div>
-      <div className="side-footer"><span className="live-dot"/> ENGINE V0.1 <span className="footer-version">BETA</span></div>
+      <div className="side-footer"><span className="live-dot"/><span className="footer-label">ENGINE V0.1</span><span className="footer-version">BETA</span></div>
     </aside>
 
     <div className="main-shell">
@@ -630,12 +667,19 @@ export default function App() {
             title={windowEffectStatus === 'failed'
               ? 'Mica/Acrylic não puderam ser solicitados: ' + windowEffectError
               : windowEffectStatus === 'requested'
-                ? 'Efeito solicitado ao Windows. A aparência final depende dos efeitos de transparência do sistema, WebView2 e DWM.'
+                ? nativeMaterial + ' solicitado ao Windows. A aparência final depende dos efeitos de transparência do sistema, WebView2 e DWM.'
                 : 'Inicializando o efeito nativo do Windows.'}>
             {windowEffectStatus === 'failed' ? 'Vidro indisponível'
-              : windowEffectStatus === 'requested' ? 'Acrylic solicitado'
+              : windowEffectStatus === 'requested' ? nativeMaterial + ' solicitado'
               : 'Ativando vidro…'}
           </span>}
+          <button type="button" className="clarity-toggle"
+            aria-pressed={clarityMode}
+            aria-label={clarityMode ? 'Ativar painéis translúcidos' : 'Reduzir transparência para facilitar leitura'}
+            title={clarityMode ? 'Restaurar vidro' : 'Usar painéis sólidos'}
+            onClick={() => setClarityMode(value => !value)}>
+            <ShieldCheck size={15}/><span>{clarityMode ? 'Modo sólido' : 'Contraste'}</span>
+          </button>
           <span className="local-pill"><span className="live-dot"/> LOCAL-FIRST</span><button className="top-help" onClick={() => selectSection('optimize')} title="Conheça os controles de segurança" aria-label="Segurança"><CircleHelp size={19}/></button><div className="user-avatar"><Disc3 size={17}/></div></div>
       </header>
       <main id="main-content" className="content">
@@ -704,10 +748,33 @@ export default function App() {
 
         {!scanned && section !== 'optimize' && section !== 'compare' && section !== 'cleanup' && section !== 'explorer' && <div className="onboarding glass">
           <div className="onboarding-content"><Tag tone="blue"><Sparkles size={13}/> INTELLIGENT STORAGE</Tag><h2>Encontre espaço que você nem sabia que tinha.</h2><p>Mapeie arquivos, compare tamanhos, descubra duplicados reais com BLAKE3 e pesquise nomes ou caminhos usando expressões regulares. Tudo acontece no seu computador.</p><button className="primary-button" disabled={busy} onClick={() => void scanFolder()}><FolderOpen size={18}/> Escolher pasta <ArrowRight size={17}/></button></div>
-          <div className="onboarding-visual"><div className="orb orb-one"/><div className="orb orb-two"/><div className="preview-card preview-main"><div className="preview-dotline"><i/><i/><i/></div><div className="preview-chart"><div/><div/><div/><div/><div/><div/><div/></div><div className="preview-baseline"/></div><div className="preview-card preview-small"><Fingerprint size={21}/><span>BLAKE3</span><CheckCircle2 size={17}/></div></div>
+          <div className="onboarding-visual" aria-hidden="true"><div className="orb orb-one"/><div className="orb orb-two"/><div className="preview-card preview-main"><div className="preview-dotline"><i/><i/><i/></div><div className="preview-chart"><div/><div/><div/><div/><div/><div/><div/></div><div className="preview-baseline"/></div><div className="preview-card preview-small"><Fingerprint size={21}/><span>BLAKE3</span><CheckCircle2 size={17}/></div></div>
         </div>}
 
         {section === 'overview' && report && <>
+          <section className="studio-overview-feature glass" aria-label="Panorama do armazenamento analisado">
+            <div className="studio-feature-copy">
+              <Tag tone="mint"><Sparkles size={13}/> ANÁLISE LOCAL</Tag>
+              <h2>Seu armazenamento, com outra perspectiva.</h2>
+              <p>Explore o espaço ocupado por categoria. O gráfico utiliza os tipos identificados nesta varredura, sem estimar espaço recuperável.</p>
+              <span className="studio-feature-note"><CheckCircle2 size={15}/> Inventário concluído · {number(report.filesScanned)} arquivos</span>
+            </div>
+            <div className="studio-feature-visual">
+              <div className="studio-feature-caption"><span>Distribuição por tipo</span>
+                <small>{report.fileTypes.length} categorias</small></div>
+              {report.fileTypes.length > 0
+                ? <div className="studio-feature-bars" role="img"
+                    aria-label={'Tamanhos lógicos relativos dos ' + Math.min(7, report.fileTypes.length) + ' maiores tipos de arquivo'}>
+                    {report.fileTypes.slice(0, 7).map((type) =>
+                      <span key={type.extension} title={type.extension + ': ' + bytes(type.sizeBytes)}
+                        style={{ height: Math.max(3, type.sizeBytes /
+                          Math.max(1, report.fileTypes[0].sizeBytes) * 100) + '%' }}/>)}
+                  </div>
+                : <p className="panel-note">Nenhum tipo de arquivo foi identificado.</p>}
+              <div className="studio-feature-legend"><span>Comparação relativa ao maior tipo</span>
+                <strong>{bytes(report.logicalBytes)} lógicos</strong></div>
+            </div>
+          </section>
           <div className="metrics-grid">
             <Metric label="Volume analisado" value={bytes(report.logicalBytes)} helper="Tamanho lógico dos arquivos" icon={Database}/>
             <Metric label="Arquivos analisados" value={number(report.filesScanned)} helper={number(report.directoriesScanned) + ' diretórios percorridos'} icon={FileSearch} tone="violet"/>
