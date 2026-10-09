@@ -33,6 +33,9 @@ Write-Host 'Compilation and fixture generation are excluded from Rust scenario t
 $runner = $null
 $stopwatch = [Diagnostics.Stopwatch]::StartNew()
 $peakWorkingSet = [long]0
+$peakCpuSeconds = [double]0
+$observedReadTransferBytes = [double]0
+$observedWriteTransferBytes = [double]0
 $sampleCount = 0
 try {
     $runner = Start-Process -FilePath $cargo.Source -ArgumentList $arguments -WorkingDirectory $root -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
@@ -45,6 +48,9 @@ try {
             if ($null -ne $native) {
                 $sampleCount++
                 $peakWorkingSet = [Math]::Max($peakWorkingSet, [long]$native.WorkingSet64)
+                $peakCpuSeconds = [Math]::Max($peakCpuSeconds, [double]$native.CPU)
+                if ($null -ne $child.ReadTransferCount) { $observedReadTransferBytes = [Math]::Max($observedReadTransferBytes, [double]$child.ReadTransferCount) }
+                if ($null -ne $child.WriteTransferCount) { $observedWriteTransferBytes = [Math]::Max($observedWriteTransferBytes, [double]$child.WriteTransferCount) }
             }
         }
         Start-Sleep -Milliseconds 250
@@ -86,7 +92,10 @@ $data = [ordered]@{
         sampled_native_peak_working_set_bytes = $peakWorkingSet
         native_process_samples = $sampleCount
         sample_period_ms = 250
-        note = 'Sampled working set is approximate; file I/O bytes come from scanner reports, not physical disk counters.'
+        sampled_native_cpu_seconds = [Math]::Round($peakCpuSeconds, 3)
+        sampled_process_read_transfer_bytes = [long]$observedReadTransferBytes
+        sampled_process_write_transfer_bytes = [long]$observedWriteTransferBytes
+        note = 'Best-effort sampling; Win32_Process transfer counters include cached/non-physical I/O and cannot be interpreted as disk throughput.'
     }
     runner_exit_code = $exitCode
 }
